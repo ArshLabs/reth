@@ -9868,6 +9868,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-pureth-receipt"
+version = "2.5.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "reth-ethereum-primitives",
+ "reth-primitives-traits",
+]
+
+[[package]]
 name = "reth-revm"
 version = "2.5.2"
 dependencies = [
