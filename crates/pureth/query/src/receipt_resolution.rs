@@ -1,6 +1,6 @@
 use crate::{receipt_log_address_gindex, BoundsError, GindexError, ResolvedPath};
 use alloy_primitives::Address;
-use reth_pureth_receipt::ReceiptsSsz;
+pub use reth_pureth_receipt::ReceiptsSsz;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptResolutionError {
