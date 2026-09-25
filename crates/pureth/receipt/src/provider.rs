@@ -2,7 +2,7 @@ use crate::{
     convert_receipts, ReceiptConversionError, ReceiptSnapshot, TreeConstructionError,
     RECEIPT_SCHEMA_ID,
 };
-use alloy_consensus::{TxLegacy, TxType};
+use alloy_consensus::{BlockHeader as _, TxLegacy, TxType};
 use alloy_primitives::{Address, Bytes, Log, Signature, TxKind, B256};
 use reth_ethereum_primitives::{
     Block, BlockBody, EthPrimitives, Receipt, Transaction as EthereumTransaction, TransactionSigned,
@@ -10,7 +10,7 @@ use reth_ethereum_primitives::{
 use reth_primitives_traits::RecoveredBlock;
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
-    BlockReader, ProviderError, ReceiptProvider, TransactionVariant,
+    BlockHashReader, BlockReader, ProviderError, ReceiptProvider, TransactionVariant,
 };
 
 pub const DETERMINISTIC_PRODUCER_REVISION: &str = "deterministic-receipt-provider-v0";
@@ -44,17 +44,38 @@ impl DeterministicProvider {
         object: ObjectKind,
         schema_id: &str,
     ) -> Result<&ProviderSnapshot, LookupError> {
-        if object != ObjectKind::Receipts {
-            return Err(LookupError::UnsupportedObject);
-        }
-        if schema_id != RECEIPT_SCHEMA_ID {
-            return Err(LookupError::UnsupportedSchema);
-        }
+        validate_lookup(object, schema_id)?;
 
         self.snapshots
             .iter()
             .find(|snapshot| snapshot.block_hash == block_hash)
             .ok_or(LookupError::UnknownBlock)
+    }
+}
+
+#[derive(Debug)]
+pub struct RethRootProvider<N: ProviderNodeTypes<Primitives = EthPrimitives>> {
+    provider: BlockchainProvider<N>,
+}
+
+impl<N> RethRootProvider<N>
+where
+    N: ProviderNodeTypes<Primitives = EthPrimitives>,
+{
+    pub const fn new(provider: BlockchainProvider<N>) -> Self {
+        Self { provider }
+    }
+
+    pub fn lookup(
+        &self,
+        block_hash: B256,
+        object: ObjectKind,
+        schema_id: &str,
+    ) -> Result<ProviderSnapshot, RethRootProviderError> {
+        validate_lookup(object, schema_id).map_err(RethRootProviderError::Lookup)?;
+
+        ProviderSnapshot::from_reth_historical(&self.provider, block_hash)
+            .map_err(map_historical_lookup_error)
     }
 }
 
@@ -77,7 +98,7 @@ impl ProviderSnapshot {
     where
         N: ProviderNodeTypes<Primitives = EthPrimitives>,
     {
-        let (block, receipts) = {
+        let (block, block_status, receipts) = {
             let view = provider
                 .consistent_provider()
                 .map_err(HistoricalAcquisitionError::ConsistentView)?;
@@ -85,11 +106,15 @@ impl ProviderSnapshot {
                 .recovered_block(block_hash.into(), TransactionVariant::WithHash)
                 .map_err(HistoricalAcquisitionError::BlockRead)?
                 .ok_or(HistoricalAcquisitionError::BlockUnavailable)?;
+            let canonical_hash = view
+                .block_hash(block.number())
+                .map_err(HistoricalAcquisitionError::CanonicalHashRead)?;
+            let block_status = derive_canonicality(block_hash, canonical_hash);
             let receipts = view
                 .receipts_by_block(block_hash.into())
                 .map_err(HistoricalAcquisitionError::ReceiptsRead)?
                 .ok_or(HistoricalAcquisitionError::ReceiptsUnavailable)?;
-            (block, receipts)
+            (block, block_status, receipts)
         };
 
         let receipts = convert_receipts(&block, &receipts)
@@ -99,7 +124,7 @@ impl ProviderSnapshot {
 
         Ok(Self {
             block_hash,
-            block_status: CanonicalityStatus::Canonical,
+            block_status,
             object: ObjectKind::Receipts,
             schema_id: RECEIPT_SCHEMA_ID,
             root_context: RootContext::RethExperimentalUnanchored,
@@ -141,6 +166,33 @@ impl ProviderSnapshot {
     }
 }
 
+fn derive_canonicality(block_hash: B256, canonical_hash: Option<B256>) -> CanonicalityStatus {
+    match canonical_hash {
+        Some(canonical_hash) if canonical_hash == block_hash => CanonicalityStatus::Canonical,
+        Some(_) => CanonicalityStatus::NonCanonical,
+        None => CanonicalityStatus::Unknown,
+    }
+}
+
+fn validate_lookup(object: ObjectKind, schema_id: &str) -> Result<(), LookupError> {
+    if object != ObjectKind::Receipts {
+        return Err(LookupError::UnsupportedObject);
+    }
+    if schema_id != RECEIPT_SCHEMA_ID {
+        return Err(LookupError::UnsupportedSchema);
+    }
+    Ok(())
+}
+
+fn map_historical_lookup_error(error: HistoricalAcquisitionError) -> RethRootProviderError {
+    match error {
+        HistoricalAcquisitionError::BlockUnavailable => {
+            RethRootProviderError::Lookup(LookupError::UnknownBlock)
+        }
+        error => RethRootProviderError::Acquisition(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
     Receipts,
@@ -171,6 +223,7 @@ pub enum ProviderBuildError {
 pub enum HistoricalAcquisitionError {
     ConsistentView(ProviderError),
     BlockRead(ProviderError),
+    CanonicalHashRead(ProviderError),
     ReceiptsRead(ProviderError),
     BlockUnavailable,
     ReceiptsUnavailable,
@@ -183,6 +236,12 @@ pub enum LookupError {
     UnknownBlock,
     UnsupportedObject,
     UnsupportedSchema,
+}
+
+#[derive(Debug)]
+pub enum RethRootProviderError {
+    Lookup(LookupError),
+    Acquisition(HistoricalAcquisitionError),
 }
 
 fn singleton_snapshot() -> Result<ProviderSnapshot, ProviderBuildError> {
@@ -331,9 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn historical_provider_returns_a_coherent_snapshot() {
+    fn reth_root_provider_returns_a_coherent_snapshot() {
         let (provider, block_hash) = historical_provider(Some(singleton_receipts()));
-        let result = ProviderSnapshot::from_reth_historical(&provider, block_hash).unwrap();
+        let provider = RethRootProvider::new(provider);
+        let result = provider.lookup(block_hash, ObjectKind::Receipts, RECEIPT_SCHEMA_ID).unwrap();
         let snapshot = result.receipt_snapshot();
 
         assert_eq!(result.block_hash(), block_hash);
@@ -358,23 +418,33 @@ mod tests {
     }
 
     #[test]
-    fn historical_provider_distinguishes_missing_blocks() {
+    fn reth_root_provider_reports_unknown_blocks() {
         let (provider, _) = historical_provider(Some(singleton_receipts()));
+        let provider = RethRootProvider::new(provider);
 
-        let result = ProviderSnapshot::from_reth_historical(&provider, B256::repeat_byte(0xff));
-        assert!(matches!(result, Err(HistoricalAcquisitionError::BlockUnavailable)));
+        let result =
+            provider.lookup(B256::repeat_byte(0xff), ObjectKind::Receipts, RECEIPT_SCHEMA_ID);
+
+        assert!(matches!(result, Err(RethRootProviderError::Lookup(LookupError::UnknownBlock))));
     }
 
     #[test]
-    fn historical_provider_distinguishes_missing_receipts() {
+    fn reth_root_provider_preserves_missing_receipts() {
         let (provider, block_hash) = historical_provider(None);
+        let provider = RethRootProvider::new(provider);
 
-        let result = ProviderSnapshot::from_reth_historical(&provider, block_hash);
-        assert!(matches!(result, Err(HistoricalAcquisitionError::ReceiptsUnavailable)));
+        let result = provider.lookup(block_hash, ObjectKind::Receipts, RECEIPT_SCHEMA_ID);
+
+        assert!(matches!(
+            result,
+            Err(RethRootProviderError::Acquisition(
+                HistoricalAcquisitionError::ReceiptsUnavailable
+            ))
+        ));
     }
 
     #[test]
-    fn historical_provider_preserves_conversion_errors() {
+    fn reth_root_provider_preserves_conversion_errors() {
         let receipts = vec![Receipt {
             tx_type: TxType::Eip1559,
             success: true,
@@ -382,17 +452,22 @@ mod tests {
             logs: Vec::new(),
         }];
         let (provider, block_hash) = historical_provider(Some(receipts));
+        let provider = RethRootProvider::new(provider);
 
-        let result = ProviderSnapshot::from_reth_historical(&provider, block_hash);
+        let result = provider.lookup(block_hash, ObjectKind::Receipts, RECEIPT_SCHEMA_ID);
+
         assert!(matches!(
             result,
-            Err(HistoricalAcquisitionError::ReceiptConversion(
-                ReceiptConversionError::TransactionTypeMismatch {
-                    index: 0,
-                    transaction,
-                    receipt,
-                }
-            )) if transaction == TxType::Legacy as u8 && receipt == TxType::Eip1559 as u8
+            Err(RethRootProviderError::Acquisition(
+                HistoricalAcquisitionError::ReceiptConversion(
+                    ReceiptConversionError::TransactionTypeMismatch {
+                        index: 0,
+                        transaction,
+                        receipt,
+                    }
+                )
+            )) if transaction == TxType::Legacy as u8 &&
+                receipt == TxType::Eip1559 as u8
         ));
     }
 
@@ -515,5 +590,66 @@ mod tests {
             provider.lookup(SINGLETON_BLOCK_HASH, ObjectKind::Receipts, "other-schema"),
             Err(LookupError::UnsupportedSchema)
         ));
+    }
+
+    #[test]
+    fn reth_root_provider_lookup_errors_follow_object_schema_block_precedence() {
+        let (provider, _) = historical_provider(Some(singleton_receipts()));
+        let provider = RethRootProvider::new(provider);
+        let unknown_block = B256::repeat_byte(0xff);
+
+        assert!(matches!(
+            provider.lookup(unknown_block, ObjectKind::Withdrawals, "other-schema"),
+            Err(RethRootProviderError::Lookup(LookupError::UnsupportedObject))
+        ));
+        assert!(matches!(
+            provider.lookup(unknown_block, ObjectKind::Receipts, "other-schema"),
+            Err(RethRootProviderError::Lookup(LookupError::UnsupportedSchema))
+        ));
+        assert!(matches!(
+            provider.lookup(unknown_block, ObjectKind::Receipts, RECEIPT_SCHEMA_ID),
+            Err(RethRootProviderError::Lookup(LookupError::UnknownBlock))
+        ));
+    }
+
+    #[test]
+    fn reth_root_provider_preserves_provider_read_failures() {
+        let block_read_error = map_historical_lookup_error(HistoricalAcquisitionError::BlockRead(
+            ProviderError::HeaderNotFound(B256::ZERO.into()),
+        ));
+
+        assert!(matches!(
+            block_read_error,
+            RethRootProviderError::Acquisition(HistoricalAcquisitionError::BlockRead(
+                ProviderError::HeaderNotFound(_)
+            ))
+        ));
+
+        let canonical_hash_read_error =
+            map_historical_lookup_error(HistoricalAcquisitionError::CanonicalHashRead(
+                ProviderError::HeaderNotFound(B256::ZERO.into()),
+            ));
+
+        assert!(matches!(
+            canonical_hash_read_error,
+            RethRootProviderError::Acquisition(HistoricalAcquisitionError::CanonicalHashRead(
+                ProviderError::HeaderNotFound(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn reth_root_provider_classifies_canonical_hash_results() {
+        let block_hash = B256::repeat_byte(0x11);
+
+        assert_eq!(
+            derive_canonicality(block_hash, Some(block_hash)),
+            CanonicalityStatus::Canonical
+        );
+        assert_eq!(
+            derive_canonicality(block_hash, Some(B256::repeat_byte(0x22))),
+            CanonicalityStatus::NonCanonical
+        );
+        assert_eq!(derive_canonicality(block_hash, None), CanonicalityStatus::Unknown);
     }
 }
