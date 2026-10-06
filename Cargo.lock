@@ -10111,6 +10111,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-pureth-transaction"
+version = "2.7.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "reth-pureth-ssz",
+]
+
+[[package]]
 name = "reth-revm"
 version = "2.7.0"
 dependencies = [
