@@ -103,6 +103,43 @@ fn single_request(path: &str, operation: SelectionOperation) -> SelectionRequest
     }
 }
 
+#[test]
+fn authority_selection_distinguishes_zero_address_from_padding() {
+    let snapshot = fixture();
+    let present = single_request("[2].authorities[1]", SelectionOperation::Value {});
+    let response = run(&snapshot, &present);
+    assert_eq!(response.results[0].values_ssz, vec![Bytes::from(vec![0; 20])]);
+
+    let absent = single_request("[2].authorities[3]", SelectionOperation::Value {});
+    assert_eq!(
+        select_receipt_snapshot(&snapshot, &absent, SelectionLimits::default()),
+        Err(SelectionError::OutOfBounds)
+    );
+    let mut indices = Vec::new();
+    let authorities = resolve_eip(&tokens("[2].authorities").unwrap(), &mut |index| {
+        indices.push(index);
+        node_at(snapshot.tree(), index).map_err(|_| SelectionError::InvalidProof)
+    })
+    .unwrap();
+    let padding = progressive(authorities.index, 3).unwrap();
+    let (node, branch) = node_and_branch(snapshot.tree(), padding).unwrap();
+    assert_eq!(node, B256::ZERO);
+    verify_branch(node, padding, &branch, snapshot.root()).unwrap();
+    indices.push(padding);
+    for format in [SelectionProofFormat::SingleBranch, SelectionProofFormat::Multiproof] {
+        let forged = compatible_receipt_response(
+            snapshot.tree(),
+            &indices,
+            Bytes::from(vec![0; 20]),
+            format,
+        );
+        assert_eq!(
+            verify_receipt_selection(&absent, &forged, snapshot.root(), SelectionLimits::default()),
+            Err(SelectionError::OutOfBounds)
+        );
+    }
+}
+
 fn filter_request(output: FilterOutput, predicates: Vec<FilterPredicate>) -> SelectionRequest {
     single_request(".", SelectionOperation::Filter { output, predicates })
 }

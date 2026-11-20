@@ -37,8 +37,9 @@ pub use query_service::{
 pub use receipt_response::{
     convert_eip6466_block_receipts, convert_eip6466_block_receipts_from_retained,
     convert_eip6466_receipt, convert_eip6466_receipt_from_retained,
-    verify_eip6466_receipt_response, ExecutionHeaderConverter, ExecutionReceiptConverter,
-    ExecutionReceiptEnvelope, ExecutionRpcReceipt, ExecutionRpcTypes,
+    verify_eip6466_receipt_response, verify_eip6466_receipt_response_with_block,
+    ExecutionHeaderConverter, ExecutionReceiptConverter, ExecutionReceiptEnvelope,
+    ExecutionRpcReceipt, ExecutionRpcTypes,
 };
 pub use receipt_response::{
     extend_block_receipt_responses, extend_receipt_response, verify_whole_receipt_proof,

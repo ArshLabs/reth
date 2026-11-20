@@ -8,9 +8,14 @@ use alloy_eips::{
     eip2718::Encodable2718,
     eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
     eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE},
+    eip4895::Withdrawal,
     eip7002::{WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS, WITHDRAWAL_REQUEST_PREDEPLOY_CODE},
     eip7251::{CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS, CONSOLIDATION_REQUEST_PREDEPLOY_CODE},
     eip7685::RequestsOrHash,
+    eip8282::{
+        BUILDER_DEPOSIT_CONTRACT_ADDRESS, BUILDER_DEPOSIT_CONTRACT_CODE,
+        BUILDER_EXIT_CONTRACT_ADDRESS, BUILDER_EXIT_CONTRACT_CODE,
+    },
     BlockId, BlockNumberOrTag,
 };
 use alloy_genesis::{Genesis, GenesisAccount};
@@ -29,7 +34,10 @@ use reth_basic_payload_builder::{
 use reth_chain_state::{CanonicalInMemoryState, NewCanonicalChain};
 use reth_chainspec::{ChainSpecBuilder, EthChainSpec, EthereumHardfork, ForkCondition};
 use reth_consensus::{Consensus, FullConsensus, HeaderValidator};
-use reth_db_api::{tables, transaction::DbTxMut};
+use reth_db_api::{
+    tables,
+    transaction::{DbTx, DbTxMut},
+};
 use reth_db_common::init::init_genesis;
 use reth_engine_primitives::{
     BeaconEngineMessage, ConsensusEngineHandle, EngineApiValidator, NoopInvalidBlockHook,
@@ -69,11 +77,15 @@ use reth_provider::{
     SaveBlocksInput, StateWriter,
 };
 use reth_pureth_block::{
-    ExecutionForkConfig, ExecutionHeader, ExecutionPrimitives, ExecutionSource,
-    ExecutionSourceProvider, PayloadLimits, PayloadSourceError, PayloadSourceInput,
+    ExecutionForkConfig, ExecutionHeader, ExecutionPrimitives, ExecutionQueryObject,
+    ExecutionQuerySource, ExecutionSource, ExecutionSourceProvider, PayloadLimits,
+    PayloadSourceError, PayloadSourceInput,
 };
 use reth_pureth_query::{
-    ExecutionHeaderConverter, ExecutionReceiptConverter, ExecutionRpcTypes, SelectionLimits,
+    select_component, verify_component_selection, verify_query_response, ComponentObject,
+    ComponentSnapshot, ExecutionHeaderConverter, ExecutionReceiptConverter, ExecutionRpcTypes,
+    QueryHandler, QueryRequest, QueryService, ReceiptSelection, SelectionLimits,
+    SelectionOperation, SelectionRequest,
 };
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_api::EngineApiServer;
@@ -114,16 +126,25 @@ struct Fixture {
 
 impl Fixture {
     async fn new(amsterdam: bool) -> Self {
+        Self::with_gas_limit(amsterdam, 30_000_000).await
+    }
+
+    async fn with_gas_limit(amsterdam: bool, gas_limit: u64) -> Self {
+        Self::configured(amsterdam, gas_limit, false).await
+    }
+
+    async fn configured(amsterdam: bool, gas_limit: u64, builder_contracts: bool) -> Self {
         let sender: PrivateKeySigner = B256::repeat_byte(9).to_string().parse().unwrap();
-        let mut genesis = Genesis {
-            gas_limit: 30_000_000,
-            base_fee_per_gas: Some(1_000_000_000),
-            ..Default::default()
-        };
+        let mut genesis =
+            Genesis { gas_limit, base_fee_per_gas: Some(1_000_000_000), ..Default::default() };
         genesis.config.amsterdam_time = amsterdam.then_some(1);
         genesis.alloc.insert(
             sender.address(),
-            GenesisAccount { balance: U256::from(10u64.pow(18)), ..Default::default() },
+            GenesisAccount {
+                balance: U256::from(10u64.pow(18)) *
+                    U256::from(if builder_contracts { 100 } else { 1 }),
+                ..Default::default()
+            },
         );
         for (address, code) in [
             (HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE.clone()),
@@ -135,6 +156,17 @@ impl Fixture {
                 address,
                 GenesisAccount { nonce: Some(1), code: Some(code), ..Default::default() },
             );
+        }
+        if builder_contracts {
+            for (address, code) in [
+                (BUILDER_DEPOSIT_CONTRACT_ADDRESS, BUILDER_DEPOSIT_CONTRACT_CODE.clone()),
+                (BUILDER_EXIT_CONTRACT_ADDRESS, BUILDER_EXIT_CONTRACT_CODE.clone()),
+            ] {
+                genesis.alloc.insert(
+                    address,
+                    GenesisAccount { nonce: Some(1), code: Some(code), ..Default::default() },
+                );
+            }
         }
         let spec = ChainSpecBuilder::mainnet().genesis(genesis);
         let spec = Arc::new(if amsterdam {
@@ -182,7 +214,7 @@ impl Fixture {
             withdrawals: amsterdam.then(Vec::new),
             parent_beacon_block_root: amsterdam.then_some(B256::repeat_byte(0x88)),
             slot_number: amsterdam.then_some(1),
-            target_gas_limit: amsterdam.then_some(30_000_000),
+            target_gas_limit: amsterdam.then_some(gas_limit),
         };
         let config = PayloadConfig::new(
             parent.clone(),
@@ -264,6 +296,220 @@ fn root_handle(root: Option<B256>) -> PayloadStateRootHandle {
     }
     StateRootHandle::new(B256::ZERO, updates, guard, root_rx, hashed_rx)
         .into_payload_state_root_handle()
+}
+
+#[tokio::test]
+async fn block_processing_accepts_transactions_above_the_old_source_cap() {
+    let fixture = Fixture::with_gas_limit(true, 60_000_000).await;
+    let spec = fixture.builder.client.chain_spec();
+    let validator = ExecutionEngineValidator::new(spec.clone(), PayloadLimits::default()).unwrap();
+    let evm =
+        ExecutionEvmConfig::new(fixture.builder.evm_config.clone(), validator.clone()).unwrap();
+    let attributes = NextBlockEnvAttributes {
+        timestamp: 12,
+        suggested_fee_recipient: fixture.config.attributes.suggested_fee_recipient,
+        prev_randao: fixture.config.attributes.prev_randao,
+        gas_limit: 60_000_000,
+        parent_beacon_block_root: fixture.config.attributes.parent_beacon_block_root,
+        withdrawals: Some(Default::default()),
+        extra_data: Bytes::new(),
+        slot_number: Some(1),
+    };
+    let mut state = State::builder()
+        .with_database(StateProviderDatabase::new(
+            fixture.builder.client.latest().unwrap().into_evm_state_provider(),
+        ))
+        .with_bundle_update()
+        .with_bal_builder_if(true)
+        .build();
+    let mut builder =
+        evm.builder_for_next_block(&mut state, &fixture.config.parent_header, attributes).unwrap();
+    builder.apply_pre_execution_changes().unwrap();
+    let signer: PrivateKeySigner = B256::repeat_byte(9).to_string().parse().unwrap();
+    for nonce in 0..4097 {
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_limit: 12_000,
+            gas_price: 2_000_000_000,
+            to: TxKind::Call(signer.address()),
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&transaction.signature_hash()).unwrap();
+        let transaction: TransactionSigned = transaction.into_signed(signature).into();
+        builder
+            .execute_transaction(Recovered::new_unchecked(transaction, signer.address()))
+            .unwrap();
+    }
+    let outcome = builder.finish(fixture.builder.client.latest().unwrap(), None).unwrap();
+    assert_eq!(outcome.block.transaction_count(), 4097);
+    assert_eq!(outcome.block.gas_used(), 49_164_000);
+    let bal = outcome.block_access_list.as_ref().unwrap();
+    let source = Arc::new(
+        ExecutionSource::from_execution(
+            Arc::new(outcome.block),
+            &outcome.execution_result,
+            bal.as_bal(),
+            spec.as_ref(),
+            &validator.fork_config(),
+            PayloadLimits::default(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(source.native_receipts().len(), 4097);
+    let block_hash = source.block().hash();
+    let request = SelectionRequest {
+        include_proof: true,
+        selections: vec![ReceiptSelection {
+            path: ".".into(),
+            operation: SelectionOperation::Whole {},
+        }],
+    };
+    let limits = SelectionLimits { source_bytes: 512 * 1024 * 1024, ..Default::default() };
+    let response = select_component(
+        ComponentSnapshot::ExecutionPayload(source.payload().unwrap()),
+        &request,
+        limits,
+    )
+    .unwrap();
+    verify_component_selection(
+        ComponentObject::ExecutionPayload,
+        &request,
+        &response,
+        block_hash,
+        limits,
+    )
+    .unwrap();
+    let built = EthBuiltPayload::<ExecutionPrimitives>::new(
+        source.block_arc().clone(),
+        U256::ZERO,
+        Some(outcome.execution_result.requests),
+        Some(bal.as_raw().clone()),
+    );
+    assert_eq!(
+        validator.convert_payload_to_block(built.into_execution_data()).unwrap().hash(),
+        block_hash
+    );
+}
+
+#[tokio::test]
+async fn gloas_sources_retain_executed_builder_deposit_and_exit_requests() {
+    let mut fixture = Fixture::configured(true, 30_000_000, true).await;
+    let validator = ExecutionEngineValidator::new(
+        fixture.builder.client.chain_spec(),
+        PayloadLimits::default(),
+    )
+    .unwrap();
+    fixture.builder.fork = validator.fork_config();
+    let sender: PrivateKeySigner = B256::repeat_byte(9).to_string().parse().unwrap();
+    let mut deposit = vec![0x11; 48];
+    deposit.extend_from_slice(&[0x22; 32]);
+    deposit.extend_from_slice(&1_000_000_000u64.to_be_bytes());
+    deposit.extend_from_slice(&[0x33; 96]);
+    for (nonce, to, input, value) in [
+        (
+            1,
+            BUILDER_DEPOSIT_CONTRACT_ADDRESS,
+            Bytes::from(deposit),
+            U256::from(10u64.pow(18)) + U256::from(1),
+        ),
+        (2, BUILDER_EXIT_CONTRACT_ADDRESS, Bytes::from(vec![0x11; 48]), U256::from(1)),
+    ] {
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_limit: 2_000_000,
+            gas_price: 2_000_000_000,
+            to: TxKind::Call(to),
+            input,
+            value,
+        };
+        let signature = sender.sign_hash_sync(&transaction.signature_hash()).unwrap();
+        let transaction: TransactionSigned = transaction.into_signed(signature).into();
+        let length = transaction.encode_2718_len();
+        fixture
+            .builder
+            .pool
+            .add_transaction(
+                TransactionOrigin::Local,
+                EthPooledTransaction::new(
+                    Recovered::new_unchecked(transaction, sender.address()),
+                    length,
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let built = fixture.build();
+    assert_eq!(built.block().transaction_count(), 3);
+    let source = built.source().unwrap();
+    let requests = source.payload().unwrap().components().requests.requests();
+    assert_eq!(requests.builder_deposits.len(), 1);
+    assert_eq!(requests.builder_exits.len(), 1);
+    assert_eq!(requests.builder_deposits[0].amount, 1_000_000_000);
+    assert_eq!(requests.builder_deposits[0].pubkey.as_slice(), &[0x11; 48]);
+    assert_eq!(requests.builder_exits[0].source_address, sender.address());
+    assert_eq!(requests.builder_exits[0].pubkey.as_slice(), &[0x11; 48]);
+    assert_eq!(
+        built.requests().unwrap().iter().map(|group| group[0]).collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert_eq!(
+        validator.convert_payload_to_block(ExecutionData::from(built.clone())).unwrap().hash(),
+        built.block().hash()
+    );
+    let evm =
+        ExecutionEvmConfig::new(fixture.builder.evm_config.clone(), validator.clone()).unwrap();
+    let result = evm
+        .executor(StateProviderDatabase::new(
+            fixture.builder.client.latest().unwrap().into_evm_state_provider(),
+        ))
+        .execute(source.block())
+        .unwrap();
+    let bal =
+        alloy_eip7928::bal::DecodedBal::from_rlp_bytes(built.block_access_list().unwrap().clone())
+            .unwrap();
+    let checked = ExecutionConsensus::new(validator)
+        .validate_block_post_execution_with_data(
+            source.block_arc(),
+            &result.result,
+            None,
+            Some(bal.hash()),
+            Some(bal.as_bal()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checked.downcast_ref::<ExecutionSource>().unwrap().payload().unwrap().root(),
+        built.block().hash()
+    );
+    assert_eq!(result.result.requests, built.requests().unwrap());
+}
+
+#[tokio::test]
+async fn selected_blocks_use_one_request_format_at_every_active_timestamp() {
+    let mut fixture = Fixture::new(true).await;
+    let earlier = fixture.build();
+    let validator = ExecutionEngineValidator::new(
+        fixture.builder.client.chain_spec(),
+        PayloadLimits::default(),
+    )
+    .unwrap();
+    fixture.config.attributes.timestamp = 24;
+    fixture.config.attributes.slot_number = Some(2);
+    let upgraded = fixture.build();
+    let original_requests = &earlier.source().unwrap().payload().unwrap().components().requests;
+    let upgraded_requests = &upgraded.source().unwrap().payload().unwrap().components().requests;
+    assert_eq!(original_requests.serialized().len(), 20);
+    assert_eq!(original_requests.root(), upgraded_requests.root());
+    assert_eq!(
+        validator.convert_payload_to_block(ExecutionData::from(earlier.clone())).unwrap().hash(),
+        earlier.block().hash(),
+    );
+    assert_eq!(
+        validator.convert_payload_to_block(ExecutionData::from(upgraded.clone())).unwrap().hash(),
+        upgraded.block().hash(),
+    );
 }
 
 #[tokio::test]
@@ -461,7 +707,7 @@ async fn fork_cancellation_and_errors_preserve_ordinary_behavior() {
     assert!(fixture.builder.try_build(fixture.args(None, None)).is_err());
     assert!(fixture.builder.build_empty_payload(fixture.config.clone()).is_err());
     fixture.builder.builder_config.skip_state_root = false;
-    fixture.builder.limits.transactions = 0;
+    fixture.builder.limits.bal_bytes = 0;
     let Err(PayloadBuilderError::Other(error)) =
         fixture.builder.try_build(fixture.args(None, None))
     else {
@@ -643,7 +889,7 @@ async fn engine_rejects_bad_commitments_inputs_and_versions() {
     assert_eq!(error.code(), -38003);
     let limited = ExecutionEngineValidator::new(
         fixture.builder.client.chain_spec(),
-        PayloadLimits { transactions: 0, ..Default::default() },
+        PayloadLimits { bytes: 0, ..Default::default() },
     )
     .unwrap();
     assert!(
@@ -874,7 +1120,13 @@ type ReceiverNodeTypes = AnyNodeTypesWithEngine<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receiver_executes_and_retains_source_before_accepting_commitments() {
-    let fixture = Fixture::new(true).await;
+    let mut fixture = Fixture::new(true).await;
+    fixture.config.attributes.withdrawals = Some(vec![Withdrawal {
+        index: 0,
+        validator_index: 0,
+        address: Address::repeat_byte(0x55),
+        amount: 1,
+    }]);
     fixture.add_withdrawal_request().await;
     tokio::task::block_in_place(|| {
         let built = fixture.build();
@@ -998,7 +1250,7 @@ async fn receiver_executes_and_retains_source_before_accepting_commitments() {
             let limited = ExecutionConsensus::new(
                 ExecutionEngineValidator::new(
                     spec.clone(),
-                    PayloadLimits { transactions: 0, ..Default::default() },
+                    PayloadLimits { bal_bytes: 0, ..Default::default() },
                 )
                 .unwrap(),
             );
@@ -1273,10 +1525,19 @@ async fn receiver_executes_and_retains_source_before_accepting_commitments() {
                 let cold = crate::ExecutionSourceBackend::new(
                     cold_provider.clone(),
                     validator.clone(),
-                    NonZeroU32::new(2).unwrap(),
+                    NonZeroU32::new(1).unwrap(),
                 )
                 .unwrap();
                 let narrow = cold.receipt_source(identity.hash.into(), &cancelled).unwrap();
+                assert!(matches!(
+                    cold.receipt_source(B256::ZERO.into(), &cancelled),
+                    Err(PayloadSourceError::MissingInput(PayloadSourceInput::Block))
+                ));
+                let reused = cold.receipt_source(identity.hash.into(), &cancelled).unwrap();
+                assert!(std::ptr::eq(
+                    narrow.receipt_snapshot().tree(),
+                    reused.receipt_snapshot().tree()
+                ));
                 let full = cold.payload_source(identity.hash.into(), &cancelled).unwrap();
                 assert!(std::ptr::eq(
                     narrow.receipt_snapshot().tree(),
@@ -1315,21 +1576,248 @@ async fn receiver_executes_and_retains_source_before_accepting_commitments() {
                 cold_provider
                     .canonical_in_memory_state()
                     .set_canonical_head(built.block().sealed_header().clone());
+                let bal_bytes = built.block_access_list().unwrap().len();
+                assert!(bal_bytes > built.block().header().summary_ssz().unwrap().len());
+                for (bytes, bal_limit, accepted) in [
+                    (bal_bytes, bal_bytes + 1, true),
+                    (bal_bytes - 1, bal_bytes + 1, false),
+                    (bal_bytes + 1, bal_bytes - 1, false),
+                ] {
+                    let limited = crate::ExecutionSourceBackend::new(
+                        BlockchainProvider::new(cold_factory.clone()).unwrap(),
+                        ExecutionEngineValidator::new(
+                            spec.clone(),
+                            PayloadLimits { bytes, bal_bytes: bal_limit, ..Default::default() },
+                        )
+                        .unwrap(),
+                        NonZeroU32::new(1).unwrap(),
+                    )
+                    .unwrap();
+                    let result = limited.query_source(
+                        ExecutionQueryObject::BlockAccessList,
+                        identity.hash.into(),
+                        &cancelled,
+                    );
+                    if accepted {
+                        let ExecutionQuerySource::BlockAccessList { snapshot, .. } =
+                            result.unwrap()
+                        else {
+                            panic!("expected a BAL-only source");
+                        };
+                        assert_eq!(
+                            snapshot.root(),
+                            source.payload().unwrap().components().block_access_list.root()
+                        );
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(PayloadSourceError::Payload(
+                                reth_pureth_block::PayloadError::LimitExceeded("BAL bytes")
+                            ))
+                        ));
+                    }
+                }
                 let no_bal_factory = cold_factory
                     .clone()
                     .with_bal_store(BalStoreHandle::new(reth_provider::NoopBalStore));
-                let no_bal = crate::ExecutionSourceBackend::new(
-                    BlockchainProvider::new(no_bal_factory).unwrap(),
-                    validator.clone(),
-                    NonZeroU32::new(2).unwrap(),
-                )
-                .unwrap();
+                let no_bal = Arc::new(
+                    crate::ExecutionSourceBackend::new(
+                        BlockchainProvider::new(no_bal_factory.clone()).unwrap(),
+                        ExecutionEngineValidator::new(
+                            spec.clone(),
+                            PayloadLimits { transactions: 1, ..Default::default() },
+                        )
+                        .unwrap(),
+                        NonZeroU32::new(2).unwrap(),
+                    )
+                    .unwrap(),
+                );
                 assert!(no_bal.receipt_source(identity.hash.into(), &cancelled).is_ok());
                 assert!(matches!(
                     no_bal.payload_source(identity.hash.into(), &cancelled),
                     Err(PayloadSourceError::MissingInput(PayloadSourceInput::BlockAccessList))
                 ));
+                let service = QueryService::from_execution_source(no_bal.clone());
+                let payload = source.payload().unwrap();
+                for (object, acquisition, path, operation, root) in [
+                    (
+                        "transactions",
+                        ExecutionQueryObject::Transactions,
+                        "[1].payload.nonce",
+                        SelectionOperation::Value {},
+                        payload.components().transactions.root(),
+                    ),
+                    (
+                        "withdrawals",
+                        ExecutionQueryObject::Withdrawals,
+                        ".",
+                        SelectionOperation::Length {},
+                        payload.components().withdrawals.root(),
+                    ),
+                    (
+                        "execution_requests",
+                        ExecutionQueryObject::ExecutionRequests,
+                        ".withdrawals",
+                        SelectionOperation::Length {},
+                        payload.components().requests.root(),
+                    ),
+                    (
+                        "execution_summary",
+                        ExecutionQueryObject::ExecutionSummary,
+                        ".parent_hash",
+                        SelectionOperation::Value {},
+                        payload.root(),
+                    ),
+                ] {
+                    let captured =
+                        no_bal.query_source(acquisition, identity.hash.into(), &cancelled).unwrap();
+                    assert!(!matches!(captured, ExecutionQuerySource::Retained(_)));
+                    let request = QueryRequest {
+                        block_hash: identity.hash,
+                        object: object.into(),
+                        selection: SelectionRequest {
+                            include_proof: true,
+                            selections: vec![ReceiptSelection { path: path.into(), operation }],
+                        },
+                    };
+                    let response = service.query(request.clone()).unwrap();
+                    verify_query_response(&request, &response, root, SelectionLimits::default())
+                        .unwrap();
+                    assert!(service.query_with_cancel(request, &AtomicBool::new(true)).is_err());
+                }
+                let withdrawal_limited = crate::ExecutionSourceBackend::new(
+                    BlockchainProvider::new(no_bal_factory.clone()).unwrap(),
+                    ExecutionEngineValidator::new(
+                        spec.clone(),
+                        PayloadLimits { withdrawals: 0, ..Default::default() },
+                    )
+                    .unwrap(),
+                    NonZeroU32::new(1).unwrap(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    withdrawal_limited.query_source(
+                        ExecutionQueryObject::Withdrawals,
+                        identity.hash.into(),
+                        &cancelled,
+                    ),
+                    Err(PayloadSourceError::LimitExceeded)
+                ));
+                let limited = crate::ExecutionSourceBackend::new(
+                    BlockchainProvider::new(no_bal_factory.clone()).unwrap(),
+                    ExecutionEngineValidator::new(
+                        spec.clone(),
+                        PayloadLimits { bytes: 1, ..Default::default() },
+                    )
+                    .unwrap(),
+                    NonZeroU32::new(1).unwrap(),
+                )
+                .unwrap();
+                for object in [
+                    ExecutionQueryObject::Transactions,
+                    ExecutionQueryObject::Withdrawals,
+                    ExecutionQueryObject::ExecutionRequests,
+                    ExecutionQueryObject::ExecutionSummary,
+                ] {
+                    assert!(matches!(
+                        limited.query_source(object, identity.hash.into(), &cancelled),
+                        Err(PayloadSourceError::LimitExceeded)
+                    ));
+                }
                 let writer = cold_factory.provider_rw().unwrap();
+                let indices = writer
+                    .tx_ref()
+                    .get::<tables::BlockBodyIndices>(identity.number)
+                    .unwrap()
+                    .unwrap();
+                writer.tx_ref().delete::<tables::BlockBodyIndices>(identity.number, None).unwrap();
+                writer.commit().unwrap();
+                for object in
+                    [ExecutionQueryObject::Transactions, ExecutionQueryObject::Withdrawals]
+                {
+                    assert!(no_bal.query_source(object, identity.hash.into(), &cancelled).is_ok());
+                }
+                let uncached = crate::ExecutionSourceBackend::new(
+                    BlockchainProvider::new(no_bal_factory).unwrap(),
+                    validator.clone(),
+                    NonZeroU32::new(1).unwrap(),
+                )
+                .unwrap();
+                let ExecutionQuerySource::Withdrawals { snapshot, .. } = uncached
+                    .query_source(
+                        ExecutionQueryObject::Withdrawals,
+                        identity.hash.into(),
+                        &cancelled,
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected a withdrawal-only source");
+                };
+                assert_eq!(snapshot.root(), payload.components().withdrawals.root());
+                let writer = cold_factory.provider_rw().unwrap();
+                let mut oversized = indices;
+                oversized.tx_count = built.block().gas_limit() / 12_000 + 1;
+                writer
+                    .tx_ref()
+                    .put::<tables::BlockBodyIndices>(identity.number, oversized)
+                    .unwrap();
+                writer.commit().unwrap();
+                assert!(matches!(
+                    uncached.query_source(
+                        ExecutionQueryObject::Transactions,
+                        identity.hash.into(),
+                        &cancelled,
+                    ),
+                    Err(PayloadSourceError::LimitExceeded),
+                ));
+                let view = cold_provider.consistent_provider().unwrap();
+                assert!(view
+                    .withdrawals_by_block(alloy_eips::BlockNumHash::new(
+                        identity.number + 1,
+                        identity.hash,
+                    ))
+                    .is_err());
+                assert_eq!(
+                    view.withdrawals_by_block(alloy_eips::BlockNumHash::new(0, B256::ZERO))
+                        .unwrap(),
+                    None
+                );
+                let expected_withdrawals = view.withdrawals_by_block(identity).unwrap().unwrap();
+                let writer = cold_factory.provider_rw().unwrap();
+                writer.tx_ref().put::<tables::BlockBodyIndices>(identity.number, indices).unwrap();
+                let stored = writer
+                    .tx_ref()
+                    .get::<tables::BlockWithdrawals>(identity.number)
+                    .unwrap()
+                    .unwrap();
+                writer.tx_ref().delete::<tables::BlockWithdrawals>(identity.number, None).unwrap();
+                writer.commit().unwrap();
+                assert_eq!(
+                    view.withdrawals_by_block(identity).unwrap(),
+                    Some(expected_withdrawals)
+                );
+                drop(view);
+                let ExecutionQuerySource::Transactions { snapshot, .. } = uncached
+                    .query_source(
+                        ExecutionQueryObject::Transactions,
+                        identity.hash.into(),
+                        &cancelled,
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected a transaction-only source");
+                };
+                assert_eq!(snapshot.root(), payload.components().transactions.root());
+                assert!(matches!(
+                    uncached.query_source(
+                        ExecutionQueryObject::Withdrawals,
+                        identity.hash.into(),
+                        &cancelled,
+                    ),
+                    Err(PayloadSourceError::SourceMismatch),
+                ));
+                let writer = cold_factory.provider_rw().unwrap();
+                writer.tx_ref().put::<tables::BlockWithdrawals>(identity.number, stored).unwrap();
                 writer
                     .tx_ref()
                     .delete::<tables::BlockExecutionRequests>(identity.number, None)
@@ -1354,6 +1842,21 @@ async fn receiver_executes_and_retains_source_before_accepting_commitments() {
                 assert!(missing.receipt_source(identity.hash.into(), &cancelled).is_ok());
                 assert!(matches!(
                     missing.payload_source(identity.hash.into(), &cancelled),
+                    Err(PayloadSourceError::MissingInput(PayloadSourceInput::Requests))
+                ));
+                for object in [
+                    ExecutionQueryObject::Transactions,
+                    ExecutionQueryObject::Withdrawals,
+                    ExecutionQueryObject::ExecutionSummary,
+                ] {
+                    assert!(missing.query_source(object, identity.hash.into(), &cancelled).is_ok());
+                }
+                assert!(matches!(
+                    missing.query_source(
+                        ExecutionQueryObject::ExecutionRequests,
+                        identity.hash.into(),
+                        &cancelled
+                    ),
                     Err(PayloadSourceError::MissingInput(PayloadSourceInput::Requests))
                 ));
                 assert!(matches!(

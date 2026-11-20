@@ -31,6 +31,12 @@ impl Default for PayloadLimits {
     }
 }
 
+impl PayloadLimits {
+    pub fn for_amsterdam_gas_limit(self, gas_limit: u64) -> Self {
+        Self { transactions: usize::try_from(gas_limit / 12_000).unwrap_or(usize::MAX), ..self }
+    }
+}
+
 #[derive(Debug)]
 pub enum PayloadError {
     LimitExceeded(&'static str),

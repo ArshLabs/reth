@@ -1,6 +1,79 @@
 use super::*;
 use reth_pureth_transaction::{TransactionPayload, TransactionSsz};
 
+#[test]
+fn request_queries_match_reference_positions_and_reject_old_roots() {
+    let reference: serde_json::Value =
+        serde_json::from_str(include_str!("../../../block/tests/fixtures/requests_gloas.json"))
+            .unwrap();
+    for case in reference["cases"].as_array().unwrap() {
+        let requests = ExecutionRequestsSnapshot::from_ssz(&bytes(&case["bytes"])).unwrap();
+        assert_eq!(requests.root(), root(&case["root"]));
+        let snapshot = ComponentSnapshot::ExecutionRequests(&requests);
+        let mut summary = reth_pureth_block::ExecutionSummary::from_ssz_bytes(&bytes(
+            &self::reference()["summary"]["bytes"],
+        ))
+        .unwrap();
+        summary.requests_root = requests.root();
+        let summary = ExecutionSummarySnapshot::build(summary).unwrap();
+        let link = link_component(snapshot, &summary, SelectionLimits::default()).unwrap();
+        verify_component_link(
+            snapshot.object(),
+            requests.root(),
+            &link,
+            summary.root(),
+            SelectionLimits::default(),
+        )
+        .unwrap();
+        assert!(verify_component_link(
+            snapshot.object(),
+            requests.root(),
+            &link,
+            B256::ZERO,
+            SelectionLimits::default(),
+        )
+        .is_err());
+        checked(snapshot, &request(&[(".", SelectionOperation::Whole {})]));
+        checked(
+            snapshot,
+            &request(&[
+                (".builder_deposits", SelectionOperation::Length {}),
+                (".builder_exits", SelectionOperation::Length {}),
+            ]),
+        );
+        for position in case["positions"].as_array().unwrap() {
+            let index = position["gindex"].as_str().unwrap().parse::<u128>().unwrap();
+            assert_eq!(node_at(requests.tree(), index).unwrap(), root(&position["node"]));
+            let mut path = String::new();
+            for part in position["path"].as_array().unwrap() {
+                if let Some(field) = part.as_str() {
+                    path.push('.');
+                    path.push_str(field);
+                } else {
+                    path.push_str(&format!("[{}]", part.as_u64().unwrap()));
+                }
+            }
+            let operation = if position["path"].as_array().unwrap().len() == 1 {
+                SelectionOperation::Whole {}
+            } else {
+                SelectionOperation::Value {}
+            };
+            let request = request(&[(&path, operation)]);
+            let response = checked(snapshot, &request);
+            if case.get("electra_root").is_some() {
+                assert!(verify_component_selection(
+                    ComponentObject::ExecutionRequests,
+                    &request,
+                    &response,
+                    root(&case["electra_root"]),
+                    SelectionLimits::default(),
+                )
+                .is_err());
+            }
+        }
+    }
+}
+
 fn transaction_reference() -> serde_json::Value {
     serde_json::from_str(include_str!("../../tests/fixtures/transactions.json")).unwrap()
 }
@@ -858,7 +931,6 @@ fn component_codecs_reject_noncanonical_offsets_incomplete_records_and_bounds() 
     summary.gas_used.blob = summary.gas_limits.blob + 1;
     assert!(summary.to_ssz_bytes().is_err());
     for requests in [
-        ExecutionRequests { deposits: vec![DepositRequest::default(); 8193], ..Default::default() },
         ExecutionRequests {
             withdrawals: vec![WithdrawalRequest::default(); 17],
             ..Default::default()
@@ -875,6 +947,7 @@ fn component_codecs_reject_noncanonical_offsets_incomplete_records_and_bounds() 
         deposits: vec![DepositRequest::default(); 8192],
         withdrawals: vec![WithdrawalRequest::default(); 16],
         consolidations: vec![ConsolidationRequest::default(); 2],
+        ..Default::default()
     };
     let encoded = maximum.to_ssz_bytes().unwrap();
     assert_eq!(ExecutionRequests::from_ssz_bytes(&encoded).unwrap(), maximum);

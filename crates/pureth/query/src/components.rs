@@ -178,6 +178,8 @@ enum Record {
     Deposit,
     WithdrawalRequest,
     Consolidation,
+    BuilderDeposit,
+    BuilderExit,
     Requests,
     Summary,
     Gas,
@@ -311,10 +313,21 @@ impl Record {
                 ("source_pubkey", Kind::Bytes(48)),
                 ("target_pubkey", Kind::Bytes(48)),
             ],
+            Self::BuilderDeposit => vec![
+                ("pubkey", Kind::Bytes(48)),
+                ("withdrawal_credentials", Kind::Bytes(32)),
+                ("amount", Kind::Scalar(8)),
+                ("signature", Kind::Bytes(96)),
+            ],
+            Self::BuilderExit => {
+                vec![("source_address", Kind::Bytes(20)), ("pubkey", Kind::Bytes(48))]
+            }
             Self::Requests => vec![
-                ("deposits", Kind::List(Self::Deposit, 8192)),
-                ("withdrawals", Kind::List(Self::WithdrawalRequest, 16)),
-                ("consolidations", Kind::List(Self::Consolidation, 2)),
+                ("deposits", Kind::List(Self::Deposit, 0)),
+                ("withdrawals", Kind::List(Self::WithdrawalRequest, 0)),
+                ("consolidations", Kind::List(Self::Consolidation, 0)),
+                ("builder_deposits", Kind::List(Self::BuilderDeposit, 0)),
+                ("builder_exits", Kind::List(Self::BuilderExit, 0)),
             ],
             Self::Gas => vec![("regular", Kind::Scalar(8)), ("blob", Kind::Scalar(8))],
             Self::Fees => vec![("regular", Kind::Scalar(32)), ("blob", Kind::Scalar(32))],
@@ -358,6 +371,7 @@ impl Record {
             }),
             Self::AuthorizationPayload(selector) => Some(if selector == 1 { 0x0d } else { 0x0f }),
             Self::Withdrawal => Some(15),
+            Self::Requests => Some(31),
             Self::Summary => Some(0x03ffff),
             Self::Gas | Self::Fees => Some(3),
             _ => None,
@@ -382,9 +396,11 @@ impl Record {
             Self::Deposit => 192,
             Self::WithdrawalRequest => 76,
             Self::Consolidation => 116,
+            Self::BuilderDeposit => 184,
+            Self::BuilderExit => 68,
             Self::Gas => 16,
             Self::Fees => 64,
-            Self::Requests => 12,
+            Self::Requests => 20,
             Self::Summary => 448,
         }
     }
@@ -751,7 +767,12 @@ fn root_of(
             payload_work(bytes, work, limit)?;
             return ExecutionPayloadSnapshot::root_from_ssz(
                 bytes,
-                PayloadLimits { bytes: limit, ..Default::default() },
+                PayloadLimits {
+                    bytes: limit,
+                    transactions: limit / 4,
+                    withdrawals: limit / 44,
+                    bal_bytes: limit,
+                },
             )
             .map_err(|error| match error {
                 PayloadError::LimitExceeded(name) => SelectionError::LimitExceeded(name),

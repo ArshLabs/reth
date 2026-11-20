@@ -25,8 +25,8 @@ use reth_chainspec::EthChainSpec;
 use reth_provider::BalStore;
 #[cfg(not(target_arch = "wasm32"))]
 use reth_pureth_block::{
-    ExecutionPayloadSnapshot, ExecutionSourceProvider, PayloadLimits, PayloadSourceError,
-    PayloadSourceMetadata, SourcePayloadSnapshot,
+    ExecutionPayloadSnapshot, ExecutionQueryObject, ExecutionQuerySource, ExecutionSourceProvider,
+    PayloadLimits, PayloadSourceError, PayloadSourceMetadata, SourcePayloadSnapshot,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -202,22 +202,54 @@ impl QueryHandler for QueryService<Arc<dyn ExecutionSourceProvider>> {
         cancelled: &AtomicBool,
     ) -> Result<QueryResponse, QueryError> {
         validate_request(&request, self.limits, cancelled)?;
-        let source = if request.object == "receipts" {
-            self.provider.receipt_source(request.block_hash.into(), cancelled)
-        } else {
-            self.provider.payload_source(request.block_hash.into(), cancelled)
+        if let Some(object) = component_object(&request.object) {
+            let acquisition = match object {
+                ComponentObject::Transactions => ExecutionQueryObject::Transactions,
+                ComponentObject::Withdrawals => ExecutionQueryObject::Withdrawals,
+                ComponentObject::ExecutionRequests => ExecutionQueryObject::ExecutionRequests,
+                ComponentObject::BlockAccessList => ExecutionQueryObject::BlockAccessList,
+                ComponentObject::ExecutionSummary => ExecutionQueryObject::ExecutionSummary,
+                ComponentObject::ExecutionPayload => ExecutionQueryObject::ExecutionPayload,
+            };
+            let source = self
+                .provider
+                .query_source(acquisition, request.block_hash.into(), cancelled)
+                .map_err(QueryError::PayloadAcquisition)?;
+            check_source(source.metadata(), request.block_hash, cancelled)?;
+            let snapshot = match &source {
+                ExecutionQuerySource::Retained(source) => ComponentSnapshot::from_payload(
+                    source.payload().map_err(QueryError::PayloadAcquisition)?,
+                    object,
+                ),
+                ExecutionQuerySource::Transactions { snapshot, .. } => {
+                    ComponentSnapshot::Transactions(snapshot)
+                }
+                ExecutionQuerySource::Withdrawals { snapshot, .. } => {
+                    ComponentSnapshot::Withdrawals(snapshot)
+                }
+                ExecutionQuerySource::ExecutionRequests { snapshot, .. } => {
+                    ComponentSnapshot::ExecutionRequests(snapshot)
+                }
+                ExecutionQuerySource::BlockAccessList { snapshot, .. } => {
+                    ComponentSnapshot::BlockAccessList(snapshot)
+                }
+                ExecutionQuerySource::ExecutionSummary { snapshot, .. } => {
+                    ComponentSnapshot::ExecutionSummary(snapshot)
+                }
+            };
+            if snapshot.object() != object {
+                return Err(QueryError::InvalidSnapshot);
+            }
+            let selection =
+                select_component_with_cancel(snapshot, &request.selection, self.limits, cancelled)?
+                    .selection;
+            return source_response(&request, source.metadata(), selection, self.limits);
         }
-        .map_err(QueryError::PayloadAcquisition)?;
+        let source = self
+            .provider
+            .receipt_source(request.block_hash.into(), cancelled)
+            .map_err(QueryError::PayloadAcquisition)?;
         check_source(source.metadata(), request.block_hash, cancelled)?;
-        if request.object != "receipts" {
-            return query_payload(
-                &request,
-                source.payload().map_err(QueryError::PayloadAcquisition)?,
-                source.metadata(),
-                self.limits,
-                cancelled,
-            );
-        }
         let selection = select_with_cancel(
             source.receipt_snapshot(),
             &request.selection,

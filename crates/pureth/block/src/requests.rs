@@ -1,6 +1,8 @@
-use crate::uint64;
+use crate::{active_container, uint64, BuilderDepositRequest, BuilderExitRequest};
 use alloy_primitives::{Address, Bytes, FixedBytes, B256};
-use reth_pureth_ssz::{merkleize_fixed, mix_in_length, RetainedNode, TreeConstructionError};
+use reth_pureth_ssz::{
+    merkleize_fixed, merkleize_progressive, mix_in_length, RetainedNode, TreeConstructionError,
+};
 use ssz::{Decode, DecodeError, SszDecoderBuilder, SszEncoder};
 use ssz_derive::{Decode, Encode};
 use std::fmt;
@@ -33,6 +35,8 @@ pub struct ExecutionRequests {
     pub deposits: Vec<DepositRequest>,
     pub withdrawals: Vec<WithdrawalRequest>,
     pub consolidations: Vec<ConsolidationRequest>,
+    pub builder_deposits: Vec<BuilderDepositRequest>,
+    pub builder_exits: Vec<BuilderExitRequest>,
 }
 
 #[derive(Debug)]
@@ -71,7 +75,7 @@ impl ExecutionRequests {
         for group in groups {
             let (&tag, body) =
                 group.split_first().ok_or(RequestsError::InvalidGroups("empty group"))?;
-            if tag > 2 {
+            if tag > 4 {
                 return Err(RequestsError::UnsupportedType(tag));
             }
             if previous.is_some_and(|previous| tag <= previous) {
@@ -83,7 +87,7 @@ impl ExecutionRequests {
             match tag {
                 0 => {
                     requests.deposits =
-                        decode_list(body, 192, 8192).map_err(RequestsError::Decode)?
+                        decode_list(body, 192, usize::MAX).map_err(RequestsError::Decode)?
                 }
                 1 => {
                     requests.withdrawals =
@@ -92,6 +96,14 @@ impl ExecutionRequests {
                 2 => {
                     requests.consolidations =
                         decode_list(body, 116, 2).map_err(RequestsError::Decode)?
+                }
+                3 => {
+                    requests.builder_deposits =
+                        decode_list(body, 184, 64).map_err(RequestsError::Decode)?
+                }
+                4 => {
+                    requests.builder_exits =
+                        decode_list(body, 68, 16).map_err(RequestsError::Decode)?
                 }
                 _ => unreachable!(),
             }
@@ -103,29 +115,37 @@ impl ExecutionRequests {
     pub fn to_ssz_bytes(&self) -> Result<Vec<u8>, RequestsError> {
         self.check_limits()?;
         let mut bytes = Vec::new();
-        let mut encoder = SszEncoder::container(&mut bytes, 12);
+        let mut encoder = SszEncoder::container(&mut bytes, 20);
         encoder.append(&self.deposits);
         encoder.append(&self.withdrawals);
         encoder.append(&self.consolidations);
+        encoder.append(&self.builder_deposits);
+        encoder.append(&self.builder_exits);
         encoder.finalize();
         Ok(bytes)
     }
 
     pub fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, RequestsError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        for _ in 0..3 {
+        for _ in 0..5 {
             builder.register_type::<Vec<u8>>().map_err(RequestsError::Decode)?;
         }
         let mut decoder = builder.build().map_err(RequestsError::Decode)?;
         let requests = Self {
             deposits: decoder
-                .decode_next_with(|bytes| decode_list::<DepositRequest>(bytes, 192, 8192))
+                .decode_next_with(|bytes| decode_list::<DepositRequest>(bytes, 192, usize::MAX))
                 .map_err(RequestsError::Decode)?,
             withdrawals: decoder
                 .decode_next_with(|bytes| decode_list::<WithdrawalRequest>(bytes, 76, 16))
                 .map_err(RequestsError::Decode)?,
             consolidations: decoder
                 .decode_next_with(|bytes| decode_list::<ConsolidationRequest>(bytes, 116, 2))
+                .map_err(RequestsError::Decode)?,
+            builder_deposits: decoder
+                .decode_next_with(|bytes| decode_list::<BuilderDepositRequest>(bytes, 184, 64))
+                .map_err(RequestsError::Decode)?,
+            builder_exits: decoder
+                .decode_next_with(|bytes| decode_list::<BuilderExitRequest>(bytes, 68, 16))
                 .map_err(RequestsError::Decode)?,
         };
         requests.check_limits()?;
@@ -134,9 +154,10 @@ impl ExecutionRequests {
 
     fn check_limits(&self) -> Result<(), RequestsError> {
         for (length, bound, name) in [
-            (self.deposits.len(), 8192, "deposits"),
             (self.withdrawals.len(), 16, "withdrawals"),
             (self.consolidations.len(), 2, "consolidations"),
+            (self.builder_deposits.len(), 64, "builder deposits"),
+            (self.builder_exits.len(), 16, "builder exits"),
         ] {
             if length > bound {
                 return Err(RequestsError::LimitExceeded(name));
@@ -191,14 +212,45 @@ impl ExecutionRequests {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(merkleize_fixed(
-            vec![
-                mix_in_length(merkleize_fixed(deposits, 8192)?, self.deposits.len()),
-                mix_in_length(merkleize_fixed(withdrawals, 16)?, self.withdrawals.len()),
-                mix_in_length(merkleize_fixed(consolidations, 2)?, self.consolidations.len()),
-            ],
-            4,
-        )?)
+        let list = |nodes, length| {
+            Ok::<_, TreeConstructionError>(mix_in_length(merkleize_progressive(nodes)?, length))
+        };
+        let mut fields = vec![
+            list(deposits, self.deposits.len())?,
+            list(withdrawals, self.withdrawals.len())?,
+            list(consolidations, self.consolidations.len())?,
+        ];
+        let deposits = self
+            .builder_deposits
+            .iter()
+            .map(|value| {
+                merkleize_fixed(
+                    vec![
+                        bytes_tree(value.pubkey.as_slice())?,
+                        RetainedNode::leaf(value.withdrawal_credentials),
+                        uint64(value.amount),
+                        bytes_tree(value.signature.as_slice())?,
+                    ],
+                    4,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let exits = self
+            .builder_exits
+            .iter()
+            .map(|value| {
+                merkleize_fixed(
+                    vec![
+                        bytes_tree(value.source_address.as_slice())?,
+                        bytes_tree(value.pubkey.as_slice())?,
+                    ],
+                    2,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        fields.push(list(deposits, self.builder_deposits.len())?);
+        fields.push(list(exits, self.builder_exits.len())?);
+        Ok(active_container(fields, 0x1f)?)
     }
 }
 
@@ -247,3 +299,6 @@ impl ExecutionRequestsSnapshot {
         self.tree.root()
     }
 }
+
+#[cfg(test)]
+mod tests;

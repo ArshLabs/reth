@@ -1,10 +1,11 @@
 #![allow(missing_docs, rustdoc::missing_crate_level_docs)]
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use reth_pureth_query::{
-    verify_eip6466_receipt_response, verify_query_response, verify_transaction_receipt,
-    QueryRequest, QueryResponse, SelectionLimits, TransactionReceiptRequest,
-    TransactionReceiptResponse,
+    verify_eip6466_receipt_response, verify_eip6466_receipt_response_with_block,
+    verify_query_response, verify_transaction_receipt, QueryRequest, QueryResponse,
+    SelectionLimits, TransactionReceiptRequest, TransactionReceiptResponse,
 };
 use serde::Deserialize;
 use std::{
@@ -27,6 +28,7 @@ enum Verification {
     Receipt {
         response: serde_json::Value,
         block_hash: B256,
+        expected_block_number: Option<u64>,
         transaction_index: u64,
         transaction_hash: B256,
         expected_root: B256,
@@ -49,6 +51,7 @@ fn verify(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         Verification::Receipt {
             mut response,
             block_hash,
+            expected_block_number,
             transaction_index,
             transaction_hash,
             expected_root,
@@ -58,16 +61,30 @@ fn verify(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
                 .and_then(|fields| fields.remove("sszProof"))
                 .ok_or_else(|| io::Error::other("receipt has no proof"))?;
             let proof = serde_json::from_value(proof)?;
-            verify_eip6466_receipt_response(
-                &response,
-                &proof,
-                block_hash,
-                transaction_index,
-                transaction_hash,
-                expected_root,
-                limits,
-            )
-            .map_err(|error| io::Error::other(format!("receipt verification failed: {error:?}")))?;
+            let result = if let Some(number) = expected_block_number {
+                verify_eip6466_receipt_response_with_block(
+                    &response,
+                    &proof,
+                    BlockNumHash::new(number, block_hash),
+                    transaction_index,
+                    transaction_hash,
+                    expected_root,
+                    limits,
+                )
+            } else {
+                verify_eip6466_receipt_response(
+                    &response,
+                    &proof,
+                    block_hash,
+                    transaction_index,
+                    transaction_hash,
+                    expected_root,
+                    limits,
+                )
+            };
+            result.map_err(|error| {
+                io::Error::other(format!("receipt verification failed: {error:?}"))
+            })?;
         }
     }
     Ok(())
@@ -187,6 +204,28 @@ mod tests {
             "transaction_hash": transaction_hash, "expected_root": expected,
         });
         verify(&serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut block_checked = record.clone();
+        block_checked["expected_block_number"] = serde_json::json!(1);
+        verify(&serde_json::to_vec(&block_checked).unwrap()).unwrap();
+        block_checked["expected_block_number"] = serde_json::json!(2);
+        assert_eq!(
+            verify(&serde_json::to_vec(&block_checked).unwrap()).unwrap_err().to_string(),
+            "receipt verification failed: InvalidContext"
+        );
+        block_checked["expected_block_number"] = serde_json::json!(1);
+        for change_receipt in [false, true] {
+            let mut changed = block_checked.clone();
+            changed["response"]["logs"][0]["blockNumber"] = serde_json::json!("0x2");
+            if change_receipt {
+                changed["response"]["blockNumber"] = serde_json::json!("0x2");
+            }
+            assert_eq!(
+                verify(&serde_json::to_vec(&changed).unwrap()).unwrap_err().to_string(),
+                "receipt verification failed: InvalidContext"
+            );
+            changed.as_object_mut().unwrap().remove("expected_block_number");
+            assert_eq!(verify(&serde_json::to_vec(&changed).unwrap()).is_ok(), change_receipt);
+        }
         for mutation in 0..8 {
             let mut changed = record.clone();
             match mutation {
