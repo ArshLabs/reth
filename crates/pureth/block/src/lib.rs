@@ -4,6 +4,8 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
 use reth_pureth_ssz::{merkleize_progressive, mix_in_length, RetainedNode, TreeConstructionError};
 
+pub use alloy_eips::eip8282::{BuilderDepositRequest, BuilderExitRequest};
+
 mod payload;
 mod requests;
 mod summary_codec;
@@ -28,9 +30,9 @@ pub use primitives::{
 mod source;
 #[cfg(feature = "native-source")]
 pub use source::{
-    blob_fee as checked_blob_fee, ExecutionSource, ExecutionSourceProvider, PayloadSourceError,
-    PayloadSourceInput, PayloadSourceKind, PayloadSourceMetadata, SourcePayloadSnapshot,
-    StateRootStatus,
+    blob_fee as checked_blob_fee, ExecutionQueryObject, ExecutionQuerySource, ExecutionSource,
+    ExecutionSourceProvider, PayloadSourceError, PayloadSourceInput, PayloadSourceKind,
+    PayloadSourceMetadata, SourcePayloadSnapshot, StateRootStatus,
 };
 
 #[cfg(feature = "native-primitives")]

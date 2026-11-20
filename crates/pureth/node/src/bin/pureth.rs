@@ -55,3 +55,29 @@ fn main() -> eyre::Result<()> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        runtime: RuntimeArgs,
+    }
+
+    #[test]
+    fn runtime_rejects_separate_request_activation() {
+        let ordinary =
+            Args::try_parse_from(["pureth", "--pureth.source-cache-entries", "1"]).unwrap();
+        assert_eq!(ordinary.runtime.source_cache_entries, NonZeroU32::MIN);
+        assert!(Args::try_parse_from([
+            "pureth",
+            "--pureth.source-cache-entries",
+            "1",
+            "--pureth.gloas-requests-timestamp",
+            "24",
+        ])
+        .is_err());
+    }
+}

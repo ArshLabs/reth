@@ -7,6 +7,7 @@ use crate::{
     SelectionError, SelectionLimits,
 };
 use alloy_consensus::{BlockHeader, Transaction, TxReceipt};
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, TxKind, B256, U64};
 use alloy_rpc_types_eth::TransactionReceipt;
 use reth_ethereum_primitives::{Block, TransactionSigned};
@@ -339,6 +340,46 @@ pub fn verify_eip6466_receipt_response(
     expected_root: B256,
     limits: SelectionLimits,
 ) -> Result<(), SelectionError> {
+    verify_eip6466_receipt_response_context(
+        receipt,
+        proof,
+        (block_hash, None),
+        index,
+        transaction_hash,
+        expected_root,
+        limits,
+    )
+}
+
+pub fn verify_eip6466_receipt_response_with_block(
+    receipt: &serde_json::Value,
+    proof: &WholeReceiptProof,
+    expected_block: BlockNumHash,
+    index: u64,
+    transaction_hash: B256,
+    expected_root: B256,
+    limits: SelectionLimits,
+) -> Result<(), SelectionError> {
+    verify_eip6466_receipt_response_context(
+        receipt,
+        proof,
+        (expected_block.hash, Some(expected_block.number)),
+        index,
+        transaction_hash,
+        expected_root,
+        limits,
+    )
+}
+
+fn verify_eip6466_receipt_response_context(
+    receipt: &serde_json::Value,
+    proof: &WholeReceiptProof,
+    (block_hash, block_number): (B256, Option<u64>),
+    index: u64,
+    transaction_hash: B256,
+    expected_root: B256,
+    limits: SelectionLimits,
+) -> Result<(), SelectionError> {
     let receipt_bytes = encoded_size(receipt, limits.response_bytes, "response bytes")?;
     encoded_size(
         &ProvenReceiptResponse { receipt, proof },
@@ -370,6 +411,7 @@ pub fn verify_eip6466_receipt_response(
     let expected = reth_pureth_receipt::Receipt::from_ssz_bytes(bytes)
         .map_err(|_| SelectionError::InvalidValue)?;
     if fields.block_hash != block_hash ||
+        block_number.is_some_and(|number| fields.block_number != U64::from(number)) ||
         fields.transaction_index != U64::from(index) ||
         fields.transaction_hash != transaction_hash
     {

@@ -3,23 +3,30 @@
 use crate::{received_source, ExecutionEngineValidator};
 use alloy_consensus::BlockHeader;
 use alloy_eip7928::bal::Bal;
-use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::B256;
+use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
+use alloy_primitives::{Sealable, B256};
 use alloy_rlp::Decodable;
 use parking_lot::{Mutex, MutexGuard};
+use pureth_withdrawal_root::WithdrawalSnapshot;
+use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks, Hardforks};
+use reth_primitives_traits::{BlockBody, SealedHeader};
 use reth_provider::{
-    providers::{BlockchainProvider, ProviderNodeTypes},
-    BalProvider, BlockHashReader, BlockNumReader, BlockReader, ProviderError, ReceiptProvider,
-    TransactionVariant,
+    providers::{BlockchainProvider, ConsistentProvider, ProviderNodeTypes},
+    BalProvider, BlockBodyIndicesProvider, BlockHashReader, BlockNumReader, BlockReader,
+    HeaderProvider, ProviderError, ReceiptProvider, TransactionVariant, TransactionsProvider,
 };
 use reth_pureth_block::{
-    ExecutionPrimitives, ExecutionSource, ExecutionSourceProvider, PayloadSourceError,
-    PayloadSourceInput, PayloadSourceKind, PayloadSourceMetadata,
+    BlockAccessListSnapshot, ExecutionHeader, ExecutionPrimitives, ExecutionQueryObject,
+    ExecutionQuerySource, ExecutionRequestsSnapshot, ExecutionSource, ExecutionSourceProvider,
+    ExecutionSummarySnapshot, PayloadError, PayloadSourceError, PayloadSourceInput,
+    PayloadSourceKind, PayloadSourceMetadata,
 };
 use reth_pureth_receipt::{CanonicalityStatus, RootContext};
+use reth_pureth_transaction::{convert_transactions, TransactionSnapshot};
 use schnellru::{ByLength, LruMap};
 use std::{
+    borrow::Cow,
     num::NonZeroU32,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -57,12 +64,11 @@ where
         })
     }
 
-    fn acquire(
+    fn capture(
         &self,
         selector: BlockId,
-        full: bool,
         cancelled: &AtomicBool,
-    ) -> Result<Arc<ExecutionSource>, PayloadSourceError> {
+    ) -> Result<CapturedSource<N>, PayloadSourceError> {
         check_cancelled(cancelled)?;
         let memory = self.provider.canonical_in_memory_state();
         // Moving markers are captured once, then checked against the canonical view below.
@@ -126,12 +132,7 @@ where
             }
         };
         check_cancelled(cancelled)?;
-        let entry = self
-            .sources
-            .lock()
-            .get_or_insert(hash, || Arc::new(SourceEntry::default()))
-            .expect("nonzero cache capacity")
-            .clone();
+        let entry = self.sources.lock().peek(&hash).cloned();
         let executed = match pending {
             Some(state) => Some(state.block()),
             None => view
@@ -139,13 +140,76 @@ where
                 .map_err(|error| read_error(PayloadSourceInput::Block, error))?
                 .or_else(|| self.provider.retained_executed_block(hash)),
         };
+        let cached = entry.as_ref().and_then(|entry| entry.receipts.try_lock()?.clone());
+        let header = if let Some(executed) = &executed {
+            executed.recovered_block.sealed_header().clone()
+        } else if let Some(source) = &cached {
+            source.block().sealed_header().clone()
+        } else {
+            view.sealed_header_by_hash(hash)
+                .map_err(|error| read_error(PayloadSourceInput::Block, error))?
+                .ok_or(PayloadSourceError::MissingInput(PayloadSourceInput::Block))?
+        };
+        if header.hash() != hash ||
+            header.header().hash_slow() != hash ||
+            header.is_ssz() !=
+                self.validator.fork_config().is_active_at_timestamp(header.timestamp())
+        {
+            return Err(PayloadSourceError::SourceMismatch);
+        }
+        let identity = header.num_hash();
+        let canonicality = match canonical_hash(header.number())? {
+            Some(expected) if expected == hash && header.number() <= head => {
+                CanonicalityStatus::Canonical
+            }
+            Some(_) => CanonicalityStatus::NonCanonical,
+            None if header.number() > head => CanonicalityStatus::NonCanonical,
+            None => CanonicalityStatus::Unknown,
+        };
+        if matches!(selector, BlockId::Hash(hash) if hash.require_canonical == Some(true)) &&
+            canonicality != CanonicalityStatus::Canonical
+        {
+            return Err(PayloadSourceError::NonCanonicalBlock(identity));
+        }
+        if canonicality == CanonicalityStatus::Canonical &&
+            header.number() > 0 &&
+            canonical_hash(header.number() - 1)? != Some(header.parent_hash())
+        {
+            return Err(PayloadSourceError::SourceMismatch);
+        }
+        check_cancelled(cancelled)?;
+        Ok(CapturedSource {
+            view,
+            executed,
+            entry,
+            header,
+            metadata: PayloadSourceMetadata {
+                native_block: identity,
+                source_kind: PayloadSourceKind::Historical,
+                canonicality,
+                root_context: RootContext::RethExperimentalUnanchored,
+            },
+        })
+    }
+
+    fn acquire(
+        &self,
+        selector: BlockId,
+        full: bool,
+        cancelled: &AtomicBool,
+    ) -> Result<Arc<ExecutionSource>, PayloadSourceError> {
+        let CapturedSource { view, executed, entry, header, metadata } =
+            self.capture(selector, cancelled)?;
+        let identity = metadata.native_block;
+        let hash = identity.hash;
+        let canonicality = metadata.canonicality;
         let retained = executed.as_ref().map(received_source).transpose();
         let retained = match retained {
             Ok(source) => source,
             Err(PayloadSourceError::MissingInput(_)) => None,
             Err(error) => return Err(error),
         };
-        let cached = entry.receipts.try_lock().and_then(|slot| slot.clone());
+        let cached = entry.as_ref().and_then(|entry| entry.receipts.try_lock()?.clone());
         let block = if let Some(executed) = &executed {
             executed.recovered_block.clone()
         } else if let Some(source) = &cached {
@@ -157,33 +221,10 @@ where
                     .ok_or(PayloadSourceError::MissingInput(PayloadSourceInput::Block))?,
             )
         };
-        if block.hash() != hash {
+        if block.num_hash() != identity || block.header() != header.header() {
             return Err(PayloadSourceError::SourceMismatch);
         }
-        if block.transaction_count() > self.validator.limits().transactions {
-            return Err(PayloadSourceError::LimitExceeded);
-        }
-        let identity = block.num_hash();
-        let canonicality = match canonical_hash(block.number())? {
-            Some(expected) if expected == hash && block.number() <= head => {
-                CanonicalityStatus::Canonical
-            }
-            Some(_) => CanonicalityStatus::NonCanonical,
-            None if block.number() > head => CanonicalityStatus::NonCanonical,
-            None => CanonicalityStatus::Unknown,
-        };
-        if matches!(selector, BlockId::Hash(hash) if hash.require_canonical == Some(true)) &&
-            canonicality != CanonicalityStatus::Canonical
-        {
-            return Err(PayloadSourceError::NonCanonicalBlock(identity));
-        }
-        if canonicality == CanonicalityStatus::Canonical &&
-            block.number() > 0 &&
-            canonical_hash(block.number() - 1)? != Some(block.parent_hash())
-        {
-            return Err(PayloadSourceError::SourceMismatch);
-        }
-        let cached_full = entry.payload.try_lock().and_then(|slot| slot.clone());
+        let cached_full = entry.as_ref().and_then(|entry| entry.payload.try_lock()?.clone());
         if let Some(source) = retained
             .as_ref()
             .filter(|source| !full || source.payload().is_ok())
@@ -192,6 +233,7 @@ where
         {
             drop(view);
             check_cancelled(cancelled)?;
+            let _ = self.sources.lock().get(&hash);
             return Ok(Arc::new(source.with_canonicality(canonicality)));
         }
         let receipts = if let Some(source) = retained.as_ref().or(cached.as_ref()) {
@@ -224,6 +266,13 @@ where
             .flatten();
         // Copy/pin native inputs, then release the DB transaction before hashing or waiting.
         drop(view);
+        check_cancelled(cancelled)?;
+        let entry = self
+            .sources
+            .lock()
+            .get_or_insert(hash, || entry.unwrap_or_else(|| Arc::new(SourceEntry::default())))
+            .expect("nonzero cache capacity")
+            .clone();
         let receipt_source = {
             let mut slot = lock_cancelled(&entry.receipts, cancelled)?;
             if slot.is_none() {
@@ -306,6 +355,213 @@ where
     ) -> Result<Arc<ExecutionSource>, PayloadSourceError> {
         self.acquire(block, true, cancelled)
     }
+
+    fn query_source(
+        &self,
+        object: ExecutionQueryObject,
+        selector: BlockId,
+        cancelled: &AtomicBool,
+    ) -> Result<ExecutionQuerySource, PayloadSourceError> {
+        if object == ExecutionQueryObject::ExecutionPayload {
+            return self.payload_source(selector, cancelled).map(ExecutionQuerySource::Retained);
+        }
+        let CapturedSource { view, executed, entry, header, metadata } =
+            self.capture(selector, cancelled)?;
+        let retained = executed.as_ref().map(received_source).transpose();
+        let retained = match retained {
+            Ok(source) => source,
+            Err(PayloadSourceError::MissingInput(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let cached = entry.as_ref().and_then(|entry| entry.payload.try_lock()?.clone());
+        if let Some(source) =
+            retained.as_ref().filter(|source| source.payload().is_ok()).or(cached.as_ref())
+        {
+            drop(view);
+            check_cancelled(cancelled)?;
+            return Ok(ExecutionQuerySource::Retained(Arc::new(
+                source.with_canonicality(metadata.canonicality),
+            )));
+        }
+        let summary = header.summary_ssz().ok_or(PayloadSourceError::UnsupportedFork)?;
+        if summary.len() > self.validator.limits().bytes {
+            return Err(PayloadSourceError::LimitExceeded);
+        }
+        let summary = ExecutionSummarySnapshot::from_ssz(summary)
+            .map_err(|error| PayloadSourceError::Payload(PayloadError::Summary(error)))?;
+        if summary.root() != metadata.native_block.hash {
+            return Err(PayloadSourceError::SourceMismatch);
+        }
+        match object {
+            ExecutionQueryObject::ExecutionSummary => {
+                drop(view);
+                check_cancelled(cancelled)?;
+                Ok(ExecutionQuerySource::ExecutionSummary { snapshot: Box::new(summary), metadata })
+            }
+            ExecutionQueryObject::Transactions | ExecutionQueryObject::Withdrawals => {
+                let cached = entry.as_ref().and_then(|entry| entry.receipts.try_lock()?.clone());
+                let block = executed
+                    .map(|executed| executed.recovered_block)
+                    .or_else(|| cached.map(|source| source.block_arc().clone()));
+                if block.as_ref().is_some_and(|block| {
+                    block.num_hash() != metadata.native_block ||
+                        block.header() != header.header() ||
+                        !block.body().is_ssz()
+                }) {
+                    return Err(PayloadSourceError::SourceMismatch);
+                }
+                if object == ExecutionQueryObject::Transactions {
+                    let limits =
+                        self.validator.limits().for_amsterdam_gas_limit(header.gas_limit());
+                    let count = if let Some(block) = &block {
+                        block.transaction_count()
+                    } else {
+                        let indices = view
+                            .block_body_indices(header.number())
+                            .map_err(|error| read_error(PayloadSourceInput::Block, error))?
+                            .ok_or(PayloadSourceError::MissingInput(PayloadSourceInput::Block))?;
+                        usize::try_from(indices.tx_count())
+                            .map_err(|_| PayloadSourceError::LimitExceeded)?
+                    };
+                    if count > limits.transactions {
+                        return Err(PayloadSourceError::LimitExceeded);
+                    }
+                    let transactions = if let Some(block) = &block {
+                        Cow::Borrowed(block.body().transactions())
+                    } else {
+                        Cow::Owned(
+                            view.transactions_by_block(metadata.native_block.hash.into())
+                                .map_err(|error| read_error(PayloadSourceInput::Block, error))?
+                                .ok_or(PayloadSourceError::MissingInput(
+                                    PayloadSourceInput::Block,
+                                ))?,
+                        )
+                    };
+                    drop(view);
+                    check_cancelled(cancelled)?;
+                    if transactions.len() != count {
+                        return Err(PayloadSourceError::SourceMismatch);
+                    }
+                    let mut size = 0usize;
+                    for transaction in transactions.iter() {
+                        check_cancelled(cancelled)?;
+                        size = size
+                            .checked_add(transaction.encode_2718_len())
+                            .filter(|size| *size <= limits.bytes)
+                            .ok_or(PayloadSourceError::LimitExceeded)?;
+                    }
+                    let snapshot = TransactionSnapshot::build(
+                        convert_transactions(transactions.as_ref())
+                            .map_err(PayloadSourceError::Transactions)?,
+                    )
+                    .map_err(PayloadSourceError::Transactions)?;
+                    if snapshot.root() != summary.summary().transactions_root {
+                        return Err(PayloadSourceError::SourceMismatch);
+                    }
+                    check_cancelled(cancelled)?;
+                    Ok(ExecutionQuerySource::Transactions { snapshot, metadata })
+                } else {
+                    let withdrawals = if let Some(block) = &block {
+                        Cow::Borrowed(
+                            block
+                                .body()
+                                .withdrawals()
+                                .ok_or(PayloadSourceError::MissingInput(
+                                    PayloadSourceInput::Withdrawals,
+                                ))?
+                                .as_slice(),
+                        )
+                    } else {
+                        Cow::Owned(
+                            view.withdrawals_by_block(metadata.native_block)
+                                .map_err(|error| {
+                                    read_error(PayloadSourceInput::Withdrawals, error)
+                                })?
+                                .ok_or(PayloadSourceError::MissingInput(
+                                    PayloadSourceInput::Withdrawals,
+                                ))?
+                                .into_inner(),
+                        )
+                    };
+                    drop(view);
+                    check_cancelled(cancelled)?;
+                    if withdrawals.len() > self.validator.limits().withdrawals ||
+                        withdrawals
+                            .len()
+                            .checked_mul(44)
+                            .is_none_or(|size| size > self.validator.limits().bytes)
+                    {
+                        return Err(PayloadSourceError::LimitExceeded);
+                    }
+                    let snapshot = WithdrawalSnapshot::build(withdrawals.into_owned())
+                        .map_err(PayloadSourceError::Withdrawals)?;
+                    if snapshot.root() != summary.summary().withdrawals_root {
+                        return Err(PayloadSourceError::SourceMismatch);
+                    }
+                    check_cancelled(cancelled)?;
+                    Ok(ExecutionQuerySource::Withdrawals { snapshot, metadata })
+                }
+            }
+            ExecutionQueryObject::ExecutionRequests => {
+                let requests = view
+                    .execution_requests(metadata.native_block)
+                    .map_err(|error| read_error(PayloadSourceInput::Requests, error))?
+                    .ok_or(PayloadSourceError::MissingInput(PayloadSourceInput::Requests))?;
+                drop(view);
+                check_cancelled(cancelled)?;
+                let mut size = 0usize;
+                for group in requests.iter() {
+                    check_cancelled(cancelled)?;
+                    size = size
+                        .checked_add(group.len())
+                        .filter(|size| *size <= self.validator.limits().bytes)
+                        .ok_or(PayloadSourceError::LimitExceeded)?;
+                }
+                let snapshot = ExecutionRequestsSnapshot::from_native_groups(&requests)
+                    .map_err(PayloadSourceError::Requests)?;
+                if snapshot.root() != summary.summary().requests_root {
+                    return Err(PayloadSourceError::SourceMismatch);
+                }
+                check_cancelled(cancelled)?;
+                Ok(ExecutionQuerySource::ExecutionRequests { snapshot, metadata })
+            }
+            ExecutionQueryObject::BlockAccessList => {
+                let raw =
+                    executed.as_ref().and_then(|block| block.bal().map(|bal| bal.as_raw().clone()));
+                drop(view);
+                check_cancelled(cancelled)?;
+                let raw = if let Some(raw) = raw {
+                    raw
+                } else {
+                    self.provider
+                        .bal_store()
+                        .get_by_hash(metadata.native_block.hash)
+                        .map_err(|error| read_error(PayloadSourceInput::BlockAccessList, error))?
+                        .ok_or(PayloadSourceError::MissingInput(
+                            PayloadSourceInput::BlockAccessList,
+                        ))?
+                };
+                let limits = self.validator.limits();
+                let snapshot =
+                    BlockAccessListSnapshot::from_rlp(raw, limits.bal_bytes.min(limits.bytes))
+                        .map_err(PayloadSourceError::Payload)?;
+                if snapshot.root() != summary.summary().block_access_list_root {
+                    return Err(PayloadSourceError::SourceMismatch);
+                }
+                check_cancelled(cancelled)?;
+                Ok(ExecutionQuerySource::BlockAccessList { snapshot, metadata })
+            }
+            ExecutionQueryObject::ExecutionPayload => unreachable!(),
+        }
+    }
+}
+
+struct CapturedSource<N: ProviderNodeTypes> {
+    view: ConsistentProvider<N>,
+    executed: Option<ExecutedBlock<ExecutionPrimitives>>,
+    entry: Option<Arc<SourceEntry>>,
+    header: SealedHeader<ExecutionHeader>,
+    metadata: PayloadSourceMetadata,
 }
 
 #[derive(Debug, Default)]

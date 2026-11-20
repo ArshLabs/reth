@@ -214,9 +214,51 @@ async fn real_payload_sources_feed_component_queries_links_and_rpc() {
     )
     .unwrap();
     let expected_root =
-        alloy_primitives::b256!("52453dd36381348f20d4bfa8a994409cd10310ce96addb7107043c66e26c9e72");
+        alloy_primitives::b256!("4eccdd1820b022663ca0235f9951499af4d8dde38798addc06d903b333818bad");
     assert_eq!(fresh.root(), expected_root);
     let cancelled = AtomicBool::new(false);
+    let gloas = SourcePayloadSnapshot::from_builder_outcome(
+        &outcome,
+        &parent,
+        &attributes,
+        spec.as_ref(),
+        reth_pureth_block::StateRootStatus::Computed,
+        PayloadLimits::default(),
+    )
+    .unwrap()
+    .into_execution_source(
+        outcome.block.clone(),
+        outcome.execution_result.receipts.clone(),
+        spec.as_ref(),
+        &ExecutionForkConfig::new(12),
+        &cancelled,
+    )
+    .unwrap();
+    let requests_root = gloas.payload().unwrap().components().requests.root();
+    let mut request = QueryRequest {
+        block_hash: gloas.block().hash(),
+        object: "execution_requests".into(),
+        selection: SelectionRequest {
+            include_proof: true,
+            selections: vec![ReceiptSelection {
+                path: ".builder_deposits".into(),
+                operation: SelectionOperation::Length {},
+            }],
+        },
+    };
+    let gloas = Arc::new(gloas);
+    let service = QueryService::from_execution_source(Arc::new(RetainedSources {
+        receipts: gloas.clone(),
+        payload: gloas,
+        receipt_calls: AtomicUsize::new(0),
+        payload_calls: AtomicUsize::new(0),
+    }));
+    let module: Methods = PurethRpc::new(service).into_rpc().into();
+    let response: QueryResponse =
+        serde_json::from_value(rpc_query(&module, &request).await["result"].clone()).unwrap();
+    verify_query_response(&request, &response, requests_root, SelectionLimits::default()).unwrap();
+    request.object = "execution_requests_gloas".into();
+    assert!(rpc_query(&module, &request).await.get("error").is_some());
     let source = SourcePayloadSnapshot::from_builder_outcome(
         &outcome,
         &parent,
@@ -284,7 +326,15 @@ async fn real_payload_sources_feed_component_queries_links_and_rpc() {
             backend.payload_calls.load(Ordering::Relaxed)
         )
     );
-    assert_query_service(service, &retained_cases, &summary_bytes, "unknown").await;
+    let module = assert_query_service(service, &retained_cases, &summary_bytes, "unknown").await;
+    let block_hash = source.block().hash();
+    assert_eq!(block_hash, expected_root);
+    let association = TransactionReceiptRequest { block_hash, transaction_index: 0 };
+    let response: TransactionReceiptResponse =
+        serde_json::from_value(rpc_association(&module, &association).await["result"].clone())
+            .unwrap();
+    verify_transaction_receipt(&association, &response, block_hash, SelectionLimits::default())
+        .unwrap();
     let received = Arc::new(
         ExecutionSource::from_execution(
             source.block_arc().clone(),

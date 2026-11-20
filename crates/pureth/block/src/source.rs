@@ -1,7 +1,8 @@
 use crate::{
     BlobFeesPerGas, BlockAccessListSnapshot, ExecutionBlock, ExecutionBody, ExecutionForkConfig,
     ExecutionHeader, ExecutionPayloadFields, ExecutionPayloadSnapshot, ExecutionRequestsSnapshot,
-    GasAmounts, PayloadComponents, PayloadError, PayloadLimits, PrimitiveError, RequestsError,
+    ExecutionSummarySnapshot, GasAmounts, PayloadComponents, PayloadError, PayloadLimits,
+    PrimitiveError, RequestsError,
 };
 use alloy_consensus::{crypto::RecoveryError, BlockHeader, Header, Transaction};
 use alloy_eip7928::{bal::Bal, BlockAccessListGasError, BlockAccessListValidationError};
@@ -60,6 +61,7 @@ impl ExecutionSource {
     ) -> Result<Self, PayloadSourceError> {
         let cancelled = AtomicBool::new(false);
         check_cancelled(&cancelled)?;
+        let limits = limits.for_amsterdam_gas_limit(block.gas_limit());
         if block.transaction_count() > limits.transactions || bal.length() > limits.bal_bytes {
             return Err(PayloadSourceError::LimitExceeded);
         }
@@ -98,6 +100,7 @@ impl ExecutionSource {
     ) -> Result<Self, PayloadSourceError> {
         check_cancelled(cancelled)?;
         let block = &self.block;
+        let limits = limits.for_amsterdam_gas_limit(block.gas_limit());
         if !fork.is_active_at_timestamp(block.timestamp()) ||
             !block.header().is_ssz() ||
             !chain_spec.is_amsterdam_active_at_timestamp(block.timestamp()) ||
@@ -160,11 +163,8 @@ impl ExecutionSource {
         check_cancelled(cancelled)?;
         let withdrawals = WithdrawalSnapshot::build(withdrawals.to_vec())
             .map_err(PayloadSourceError::Withdrawals)?;
-        let requests = ExecutionRequestsSnapshot::build(
-            crate::ExecutionRequests::from_native_groups(requests)
-                .map_err(PayloadSourceError::Requests)?,
-        )
-        .map_err(PayloadSourceError::Requests)?;
+        let requests = ExecutionRequestsSnapshot::from_native_groups(requests)
+            .map_err(PayloadSourceError::Requests)?;
         check_cancelled(cancelled)?;
         let block_access_list =
             BlockAccessListSnapshot::from_rlp(alloy_rlp::encode(bal).into(), limits.bal_bytes)
@@ -344,6 +344,48 @@ pub trait ExecutionSourceProvider: fmt::Debug + Send + Sync {
         block: BlockId,
         cancelled: &AtomicBool,
     ) -> Result<Arc<ExecutionSource>, PayloadSourceError>;
+
+    fn query_source(
+        &self,
+        _object: ExecutionQueryObject,
+        block: BlockId,
+        cancelled: &AtomicBool,
+    ) -> Result<ExecutionQuerySource, PayloadSourceError> {
+        self.payload_source(block, cancelled).map(ExecutionQuerySource::Retained)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionQueryObject {
+    Transactions,
+    Withdrawals,
+    ExecutionRequests,
+    BlockAccessList,
+    ExecutionSummary,
+    ExecutionPayload,
+}
+
+#[derive(Debug)]
+pub enum ExecutionQuerySource {
+    Retained(Arc<ExecutionSource>),
+    Transactions { snapshot: TransactionSnapshot, metadata: PayloadSourceMetadata },
+    Withdrawals { snapshot: WithdrawalSnapshot, metadata: PayloadSourceMetadata },
+    ExecutionRequests { snapshot: ExecutionRequestsSnapshot, metadata: PayloadSourceMetadata },
+    BlockAccessList { snapshot: BlockAccessListSnapshot, metadata: PayloadSourceMetadata },
+    ExecutionSummary { snapshot: Box<ExecutionSummarySnapshot>, metadata: PayloadSourceMetadata },
+}
+
+impl ExecutionQuerySource {
+    pub fn metadata(&self) -> &PayloadSourceMetadata {
+        match self {
+            Self::Retained(source) => source.metadata(),
+            Self::Transactions { metadata, .. } |
+            Self::Withdrawals { metadata, .. } |
+            Self::ExecutionRequests { metadata, .. } |
+            Self::BlockAccessList { metadata, .. } |
+            Self::ExecutionSummary { metadata, .. } => metadata,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -422,6 +464,7 @@ impl SourcePayloadSnapshot {
             return Err(PayloadSourceError::StateRootSkipped);
         }
         let header = outcome.block.header();
+        let limits = limits.for_amsterdam_gas_limit(header.gas_limit);
         let params = chain_spec
             .blob_params_at_timestamp(header.timestamp)
             .ok_or(PayloadSourceError::UnsupportedFork)?;
@@ -655,6 +698,7 @@ impl SourcePayloadSnapshot {
     {
         check_cancelled(cancelled)?;
         let header = block.header();
+        let limits = limits.for_amsterdam_gas_limit(header.gas_limit);
         if header.hash_slow() != block.hash() {
             return Err(PayloadSourceError::SourceMismatch);
         }
@@ -1226,7 +1270,7 @@ mod tests {
         assert_eq!(
             fresh.root(),
             alloy_primitives::b256!(
-                "52453dd36381348f20d4bfa8a994409cd10310ce96addb7107043c66e26c9e72"
+                "4eccdd1820b022663ca0235f9951499af4d8dde38798addc06d903b333818bad"
             )
         );
     }
@@ -1456,7 +1500,7 @@ mod tests {
         .unwrap();
         for limit in [
             PayloadLimits { bal_bytes: raw.len() - 1, ..Default::default() },
-            PayloadLimits { transactions: 0, ..Default::default() },
+            PayloadLimits { bal_bytes: 0, ..Default::default() },
         ] {
             assert!(matches!(
                 SourcePayloadSnapshot::from_reth_historical(
@@ -1599,7 +1643,7 @@ mod tests {
         assert_eq!(
             snapshot.root(),
             alloy_primitives::b256!(
-                "778a5da0234c90c2ff0af86f57887a4b43fb5100dd65239d8a80825fa0d724f2"
+                "e7eb2b302f0b9f95d1cc6fd68820d1ad91cf25176da2c175e9cd440148de8eb1"
             )
         );
         assert_eq!(snapshot.payload().components().receipts.root(), reference.root());
@@ -1644,7 +1688,7 @@ mod tests {
         assert_eq!(
             snapshot.root(),
             alloy_primitives::b256!(
-                "377b83f9275e7092066c6c353fbe221c67240635167ca03f68a14967864b5f88"
+                "b2b626418a655baa43d58d9a7235750095f917e32e6864ac743cdf87bb45fd68"
             )
         );
     }
@@ -1725,7 +1769,7 @@ mod tests {
             );
         }
         let mut result = outcome.execution_result.clone();
-        result.requests = alloy_eips::eip7685::Requests::new(vec![Bytes::from_static(&[3, 1])]);
+        result.requests = alloy_eips::eip7685::Requests::new(vec![Bytes::from_static(&[5, 1])]);
         assert!(matches!(
             SourcePayloadSnapshot::build(
                 &outcome.block,
@@ -1737,7 +1781,7 @@ mod tests {
                 PayloadLimits::default(),
                 &AtomicBool::new(false)
             ),
-            Err(PayloadSourceError::Requests(RequestsError::UnsupportedType(3)))
+            Err(PayloadSourceError::Requests(RequestsError::UnsupportedType(5)))
         ));
     }
 
@@ -1755,7 +1799,7 @@ mod tests {
         assert_eq!(
             requests.root(),
             alloy_primitives::b256!(
-                "21e7039cd364059635889c9e92ae80dba81718c4ea07700c5d404b8e6ead552a"
+                "04ed8ebf19f6dbf9888c267cb593389168070d3374b3409597a8d52afad140dd"
             )
         );
         assert_eq!(
@@ -1768,7 +1812,7 @@ mod tests {
         assert_eq!(
             snapshot.root(),
             alloy_primitives::b256!(
-                "06908b870b98d80f2cdfc3d12008e83cda26cbaeb014e5f35f5700204a61e747"
+                "771a130ac3a0439709b02b2f0b275e1e14a8911e8dce7fd20bf7001943298c17"
             )
         );
         assert_eq!(snapshot.payload().components().requests.root(), requests.root());

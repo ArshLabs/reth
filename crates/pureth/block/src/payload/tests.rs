@@ -3,6 +3,17 @@ use crate::{ExecutionRequests, RequestsError};
 use reth_pureth_receipt::eip6466::{BasicReceipt, Receipt, Receipts};
 use serde_json::Value;
 
+#[test]
+fn block_transaction_bound_follows_the_selected_gas_rules() {
+    let limits = PayloadLimits::default();
+    assert_eq!(limits.transactions, 4096);
+    assert_eq!(limits.for_amsterdam_gas_limit(60_000_000).transactions, 5000);
+    assert_eq!(limits.for_amsterdam_gas_limit(49_164_000).transactions, 4097);
+    assert_eq!(limits.for_amsterdam_gas_limit(49_163_999).transactions, 4096);
+    assert_eq!(limits.for_amsterdam_gas_limit(0).transactions, 0);
+    assert_eq!(limits.for_amsterdam_gas_limit(60_000_000).bytes, limits.bytes);
+}
+
 fn reference() -> Value {
     serde_json::from_str(include_str!("../../tests/fixtures/payload.json")).unwrap()
 }
@@ -272,9 +283,12 @@ fn native_request_groups_preserve_records_and_reject_unknown_duplicate_and_empty
         u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize,
         u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize,
         u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize,
+        u32::from_le_bytes(encoded[12..16].try_into().unwrap()) as usize,
+        u32::from_le_bytes(encoded[16..20].try_into().unwrap()) as usize,
         encoded.len(),
     ];
-    let groups: Vec<Bytes> = (0..3)
+    let groups: Vec<Bytes> = (0..5)
+        .filter(|index| offsets[*index] != offsets[*index + 1])
         .map(|index| {
             let mut bytes = vec![index as u8];
             bytes.extend_from_slice(&encoded[offsets[index]..offsets[index + 1]]);
@@ -293,7 +307,7 @@ fn native_request_groups_preserve_records_and_reject_unknown_duplicate_and_empty
     ] {
         assert!(ExecutionRequests::from_native_groups(&groups).is_err());
     }
-    for tag in [3, 4, 255] {
+    for tag in [5, 6, 255] {
         assert!(
             matches!(ExecutionRequests::from_native_groups(&[Bytes::from(vec![tag, 0])]), Err(RequestsError::UnsupportedType(actual)) if actual == tag)
         );

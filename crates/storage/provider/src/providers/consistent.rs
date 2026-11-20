@@ -11,12 +11,17 @@ use alloy_consensus::{
     BlockHeader,
 };
 use alloy_eips::{
-    eip7685::Requests, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, HashOrNumber,
+    eip4895::Withdrawals, eip7685::Requests, BlockHashOrNumber, BlockId, BlockNumHash,
+    BlockNumberOrTag, HashOrNumber,
 };
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, TxHash, TxNumber, B256};
 use reth_chain_state::{BlockState, CanonicalInMemoryState, ExecutedBlock};
 use reth_chainspec::ChainInfo;
-use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
+use reth_db_api::{
+    models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices},
+    tables,
+    transaction::DbTx,
+};
 use reth_execution_types::{BlockExecutionResult, RecoveredBlockAndExecutionOutput};
 use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
 use reth_primitives_traits::{
@@ -111,6 +116,32 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
     /// outcomes can contain default empty requests when historical bodies were unavailable.
     pub fn execution_requests(&self, block: BlockNumHash) -> ProviderResult<Option<Requests>> {
         self.storage_provider.execution_requests(block)
+    }
+
+    #[allow(missing_docs)]
+    pub fn withdrawals_by_block(&self, block: BlockNumHash) -> ProviderResult<Option<Withdrawals>> {
+        let Some(header) = self.header(block.hash)? else { return Ok(None) };
+        if header.number() != block.number || self.block_hash(block.number)? != Some(block.hash) {
+            return Err(ProviderError::other(std::io::Error::other(
+                "withdrawals do not match the captured canonical block identity",
+            )));
+        }
+        if header.withdrawals_root().is_none() {
+            return Ok(None);
+        }
+        self.get_in_memory_or_storage_by_block(
+            block.hash.into(),
+            |provider| {
+                Ok(Some(
+                    provider
+                        .tx_ref()
+                        .get::<tables::BlockWithdrawals>(block.number)?
+                        .map(|stored| stored.withdrawals)
+                        .unwrap_or_default(),
+                ))
+            },
+            |state| Ok(state.block_ref().recovered_block().body().withdrawals().cloned()),
+        )
     }
 
     /// Consumes this consistent view and returns its database provider snapshot.

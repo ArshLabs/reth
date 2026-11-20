@@ -272,6 +272,7 @@ impl ExecutionEngineValidator {
             return Err(NewPayloadError::other(PayloadSourceError::UnsupportedFork));
         }
         let input = data.payload.as_v1();
+        let limits = self.limits.for_amsterdam_gas_limit(input.gas_limit);
         let size = input
             .transactions
             .iter()
@@ -285,7 +286,7 @@ impl ExecutionEngineValidator {
                     values.len().checked_mul(44).and_then(|bytes| size.checked_add(bytes))
                 })
             });
-        if input.transactions.len() > self.limits.transactions ||
+        if input.transactions.len() > limits.transactions ||
             data.payload.block_access_list().is_some_and(|bal| bal.len() > self.limits.bal_bytes) ||
             data.payload
                 .withdrawals()
@@ -306,11 +307,8 @@ impl ExecutionEngineValidator {
         let requests = data.sidecar.requests().ok_or_else(|| {
             NewPayloadError::other(PayloadSourceError::MissingInput(PayloadSourceInput::Requests))
         })?;
-        let requests = ExecutionRequestsSnapshot::build(
-            ExecutionRequests::from_native_groups(requests)
-                .map_err(|error| NewPayloadError::other(PayloadSourceError::Requests(error)))?,
-        )
-        .map_err(|error| NewPayloadError::other(PayloadSourceError::Requests(error)))?;
+        let requests = ExecutionRequestsSnapshot::from_native_groups(requests)
+            .map_err(|error| NewPayloadError::other(PayloadSourceError::Requests(error)))?;
         let expected = data.payload.block_hash();
         let block = data.payload.try_into_block_with_sidecar::<TransactionSigned>(&data.sidecar)?;
         if block.header.logs_bloom != Bloom::repeat_byte(0xff) {

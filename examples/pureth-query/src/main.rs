@@ -106,17 +106,14 @@ async fn run() -> eyre::Result<()> {
     };
     let response: QueryResponse =
         client.request("pureth_query", rpc_params![request.clone()]).await?;
-    eyre::ensure!(response.block_hash == block_hash);
+    verify_query_response(&request, &response, expected_root, SelectionLimits::default())
+        .map_err(|error| eyre::eyre!("{error:?}"))?;
     eyre::ensure!(
         response.selection.results[0].values_ssz[0].as_ref() == signer_address.as_slice()
     );
     eyre::ensure!(response.selection.results[1].values_ssz[0].as_ref() == [1]);
     eyre::ensure!(response.selection.results[2].values_ssz[0].as_ref() == topic.as_slice());
     eyre::ensure!(response.selection.results[3].values_ssz[0].as_ref() == [0xad, 0xbe]);
-    eyre::ensure!(response.block_status == "canonical");
-    eyre::ensure!(response.root_context == "reth_experimental_unanchored");
-    verify_query_response(&request, &response, expected_root, SelectionLimits::default())
-        .map_err(|error| eyre::eyre!("{error:?}"))?;
 
     let missing = QueryRequest { block_hash: B256::repeat_byte(0xff), ..request };
     let error =

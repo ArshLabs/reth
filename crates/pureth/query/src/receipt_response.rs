@@ -16,7 +16,7 @@ mod runtime;
 pub use native::{
     convert_eip6466_block_receipts, convert_eip6466_block_receipts_from_retained,
     convert_eip6466_receipt, convert_eip6466_receipt_from_retained,
-    verify_eip6466_receipt_response,
+    verify_eip6466_receipt_response, verify_eip6466_receipt_response_with_block,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime::{
